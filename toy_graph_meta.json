@@ -1,0 +1,13 @@
+{
+  "W": 4,
+  "mode": "selfsup",
+  "seed": 42,
+  "num_total": 200,
+  "num_train": 160,
+  "num_val": 20,
+  "num_test": 20,
+  "source_files": [
+    "data/toy.npz"
+  ],
+  "outfile": "data\\toy_graph.pt"
+}
