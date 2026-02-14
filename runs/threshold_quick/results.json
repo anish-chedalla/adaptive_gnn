@@ -1,0 +1,178 @@
+{
+  "config": {
+    "p_min": 0.01,
+    "p_max": 0.04,
+    "num_points": 3,
+    "shots": 1000,
+    "eta": 20.0,
+    "drift_amp": 0.015,
+    "drift_period": 500,
+    "gnn_model": "runs/drift_train/best_model.pt",
+    "bposd": true
+  },
+  "code": {
+    "n": 72,
+    "mx": 36,
+    "mz": 36,
+    "k": 14
+  },
+  "results": [
+    {
+      "p": 0.01,
+      "noise_type": "static",
+      "shots": 1000,
+      "elapsed_s": 75.0,
+      "bp": {
+        "errors": 1,
+        "ler": 0.001,
+        "ci_low": 0.00017654637062607809,
+        "ci_high": 0.0056425585979579355,
+        "convergence": 0.999
+      },
+      "gnn_bp": {
+        "errors": 1,
+        "ler": 0.001,
+        "ci_low": 0.00017654637062607809,
+        "ci_high": 0.0056425585979579355,
+        "convergence": 1.0
+      },
+      "bposd": {
+        "errors": 1,
+        "ler": 0.001,
+        "ci_low": 0.00017654637062607809,
+        "ci_high": 0.0056425585979579355
+      }
+    },
+    {
+      "p": 0.025,
+      "noise_type": "static",
+      "shots": 1000,
+      "elapsed_s": 128.6,
+      "bp": {
+        "errors": 19,
+        "ler": 0.019,
+        "ci_low": 0.012196885750790904,
+        "ci_high": 0.02948445591231312,
+        "convergence": 0.99
+      },
+      "gnn_bp": {
+        "errors": 17,
+        "ler": 0.017,
+        "ci_low": 0.010640689856816328,
+        "ci_high": 0.027055958840229925,
+        "convergence": 0.993
+      },
+      "bposd": {
+        "errors": 20,
+        "ler": 0.02,
+        "ci_low": 0.012983682916415136,
+        "ci_high": 0.030690005229717786
+      }
+    },
+    {
+      "p": 0.04,
+      "noise_type": "static",
+      "shots": 1000,
+      "elapsed_s": 159.4,
+      "bp": {
+        "errors": 94,
+        "ler": 0.094,
+        "ci_low": 0.07743417357376373,
+        "ci_high": 0.11367315431650704,
+        "convergence": 0.958
+      },
+      "gnn_bp": {
+        "errors": 88,
+        "ler": 0.088,
+        "ci_low": 0.07198099794232085,
+        "ci_high": 0.10717225104977657,
+        "convergence": 0.983
+      },
+      "bposd": {
+        "errors": 94,
+        "ler": 0.094,
+        "ci_low": 0.07743417357376373,
+        "ci_high": 0.11367315431650704
+      }
+    },
+    {
+      "p": 0.01,
+      "noise_type": "drift",
+      "shots": 1000,
+      "elapsed_s": 75.0,
+      "bp": {
+        "errors": 4,
+        "ler": 0.004,
+        "ci_low": 0.0015565881404084308,
+        "ci_high": 0.010239556277262253,
+        "convergence": 0.998
+      },
+      "gnn_bp": {
+        "errors": 2,
+        "ler": 0.002,
+        "ci_low": 0.000548643588120728,
+        "ci_high": 0.007262807863492177,
+        "convergence": 0.999
+      },
+      "bposd": {
+        "errors": 4,
+        "ler": 0.004,
+        "ci_low": 0.0015565881404084308,
+        "ci_high": 0.010239556277262253
+      }
+    },
+    {
+      "p": 0.025,
+      "noise_type": "drift",
+      "shots": 1000,
+      "elapsed_s": 126.8,
+      "bp": {
+        "errors": 49,
+        "ler": 0.049,
+        "ci_low": 0.037261034647360615,
+        "ci_high": 0.06419070150661013,
+        "convergence": 0.978
+      },
+      "gnn_bp": {
+        "errors": 43,
+        "ler": 0.043,
+        "ci_low": 0.03207865341171336,
+        "ci_high": 0.057419003844084014,
+        "convergence": 0.985
+      },
+      "bposd": {
+        "errors": 41,
+        "ler": 0.041,
+        "ci_low": 0.030364971082098315,
+        "ci_high": 0.0551479932076413
+      }
+    },
+    {
+      "p": 0.04,
+      "noise_type": "drift",
+      "shots": 1000,
+      "elapsed_s": 146.9,
+      "bp": {
+        "errors": 108,
+        "ler": 0.108,
+        "ci_low": 0.09024119856255189,
+        "ci_high": 0.12875898009012332,
+        "convergence": 0.954
+      },
+      "gnn_bp": {
+        "errors": 99,
+        "ler": 0.099,
+        "ci_low": 0.08199544136866538,
+        "ci_high": 0.11907361893674984,
+        "convergence": 0.976
+      },
+      "bposd": {
+        "errors": 104,
+        "ler": 0.104,
+        "ci_low": 0.08657102809826807,
+        "ci_high": 0.12445976462229157
+      }
+    }
+  ],
+  "total_elapsed_s": 712.3
+}

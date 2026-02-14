@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd:*)",
+      "Bash(dir /s /b)",
+      "Bash([ -f pyproject.toml ])",
+      "Bash([ -f setup.py ])",
+      "Bash([ -f setup.cfg ])",
+      "Bash([ -f requirements.txt ])",
+      "Bash(python:*)",
+      "Bash(copy:*)",
+      "Bash(pip install:*)",
+      "Bash(ls \"C:\\\\Users\\\\saiko\\\\project\\\\QLDPC Pipline 2\\\\data\"\" 2>&1 || echo \"No data dir\"; ls \"C:UserssaikoprojectQLDPC Pipline 2.data\"* 2>&1 || echo \"No .data files \")",
+      "Bash(.venv/Scripts/python:*)",
+      "Bash(powershell:*)",
+      "Bash(python3:*)",
+      "Bash(timeout:*)",
+      "Bash(ping:*)",
+      "Bash(dir:*)"
+    ]
+  }
+}

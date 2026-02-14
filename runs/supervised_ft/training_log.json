@@ -1,0 +1,217 @@
+{
+  "task": "supervised",
+  "model": "TannerGNN",
+  "hidden_dim": 64,
+  "num_mp_layers": 3,
+  "num_params": 153921,
+  "num_epochs": 10,
+  "batch_size": 16,
+  "learning_rate": 0.0001,
+  "loss_fn": "mse",
+  "bp_iters": 10,
+  "grad_clip": 1.0,
+  "scheduler": "cosine",
+  "pretrained": "runs/drift_train/best_model.pt",
+  "from_scratch": false,
+  "seed": 42,
+  "W": 4,
+  "num_train": 8000,
+  "num_val": 1000,
+  "source_files": [
+    "data/supervised_train.npz"
+  ],
+  "best_val_loss": 0.0012304798492243927,
+  "total_time_s": 801.8862776756287,
+  "history": [
+    {
+      "epoch": 1,
+      "train": {
+        "loss": 0.0018825659803131925,
+        "bit_acc_z": 0.997949654340744,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.992375,
+        "convergence_x": 1.0
+      },
+      "val": {
+        "loss": 0.0017074585938915438,
+        "bit_acc_z": 0.9981536600324843,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.9861111111111112,
+        "convergence_x": 1.0
+      },
+      "lr": 9.757729755661011e-05,
+      "time_s": 72.44049882888794
+    },
+    {
+      "epoch": 2,
+      "train": {
+        "loss": 0.0016113574103839507,
+        "bit_acc_z": 0.9982604187726974,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.9935,
+        "convergence_x": 1.0
+      },
+      "val": {
+        "loss": 0.0015597219912070245,
+        "bit_acc_z": 0.9981536600324843,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.9851190476190477,
+        "convergence_x": 1.0
+      },
+      "lr": 9.05463412215599e-05,
+      "time_s": 75.23832535743713
+    },
+    {
+      "epoch": 3,
+      "train": {
+        "loss": 0.0016536005127093208,
+        "bit_acc_z": 0.9981996537446975,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.9925,
+        "convergence_x": 1.0
+      },
+      "val": {
+        "loss": 0.001510978934821955,
+        "bit_acc_z": 0.9982363316747878,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.9861111111111112,
+        "convergence_x": 1.0
+      },
+      "lr": 7.959536998847742e-05,
+      "time_s": 76.54158639907837
+    },
+    {
+      "epoch": 4,
+      "train": {
+        "loss": 0.0016804606835155182,
+        "bit_acc_z": 0.9981979182958602,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.9925,
+        "convergence_x": 1.0
+      },
+      "val": {
+        "loss": 0.0012858709209203041,
+        "bit_acc_z": 0.998539461976006,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.9871031746031746,
+        "convergence_x": 1.0
+      },
+      "lr": 6.57963412215599e-05,
+      "time_s": 76.72033858299255
+    },
+    {
+      "epoch": 5,
+      "train": {
+        "loss": 0.0015877126263082002,
+        "bit_acc_z": 0.9982430566549301,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.990625,
+        "convergence_x": 1.0
+      },
+      "val": {
+        "loss": 0.0012304798492243927,
+        "bit_acc_z": 0.9986910271266151,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.9871031746031746,
+        "convergence_x": 1.0
+      },
+      "lr": 5.05e-05,
+      "time_s": 77.68954968452454
+    },
+    {
+      "epoch": 6,
+      "train": {
+        "loss": 0.001637737782942392,
+        "bit_acc_z": 0.9981631958484649,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.991,
+        "convergence_x": 1.0
+      },
+      "val": {
+        "loss": 0.0017674111592739683,
+        "bit_acc_z": 0.9978780878914727,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.9841269841269841,
+        "convergence_x": 1.0
+      },
+      "lr": 3.5203658778440106e-05,
+      "time_s": 78.32576417922974
+    },
+    {
+      "epoch": 7,
+      "train": {
+        "loss": 0.001623567695363608,
+        "bit_acc_z": 0.9981371541023254,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.987625,
+        "convergence_x": 1.0
+      },
+      "val": {
+        "loss": 0.001272485924626326,
+        "bit_acc_z": 0.9986359117523073,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.9831349206349206,
+        "convergence_x": 1.0
+      },
+      "lr": 2.1404630011522586e-05,
+      "time_s": 83.64461517333984
+    },
+    {
+      "epoch": 8,
+      "train": {
+        "loss": 0.0017015592487834572,
+        "bit_acc_z": 0.9980104182958602,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.98725,
+        "convergence_x": 1.0
+      },
+      "val": {
+        "loss": 0.0013172873040187224,
+        "bit_acc_z": 0.9985256847881135,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.9841269841269841,
+        "convergence_x": 1.0
+      },
+      "lr": 1.0453658778440107e-05,
+      "time_s": 89.9179458618164
+    },
+    {
+      "epoch": 9,
+      "train": {
+        "loss": 0.0015950975577810863,
+        "bit_acc_z": 0.9981475706100464,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.98525,
+        "convergence_x": 1.0
+      },
+      "val": {
+        "loss": 0.0013431326412513343,
+        "bit_acc_z": 0.9984154549856035,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.9841269841269841,
+        "convergence_x": 1.0
+      },
+      "lr": 3.4227024433899e-06,
+      "time_s": 85.9767713546753
+    },
+    {
+      "epoch": 10,
+      "train": {
+        "loss": 0.0016387322154101662,
+        "bit_acc_z": 0.9981076399087906,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.985,
+        "convergence_x": 1.0
+      },
+      "val": {
+        "loss": 0.0013453372486587384,
+        "bit_acc_z": 0.9984567912798079,
+        "bit_acc_x": 1.0,
+        "convergence_z": 0.9841269841269841,
+        "convergence_x": 1.0
+      },
+      "lr": 1.0000000000000002e-06,
+      "time_s": 85.34487795829773
+    }
+  ]
+}

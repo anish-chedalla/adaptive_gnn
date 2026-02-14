@@ -1,0 +1,27 @@
+{
+  "task": "selfsupervised",
+  "model": "TannerGNN",
+  "num_epochs": 3,
+  "batch_size": 16,
+  "learning_rate": 0.001,
+  "seed": 42,
+  "W": 4,
+  "num_train": 160,
+  "num_val": 20,
+  "source_files": [
+    "data/toy.npz"
+  ],
+  "train_losses": [
+    0.6931826114654541,
+    0.6039305090904236,
+    0.5993450522422791
+  ],
+  "val_losses": [
+    0.6027228832244873,
+    0.5996364951133728,
+    0.5977886617183685
+  ],
+  "best_val_loss": 0.5977886617183685,
+  "final_model": "runs\\selfsup_test\\final_model.pt",
+  "best_model": "runs\\selfsup_test\\best_model.pt"
+}

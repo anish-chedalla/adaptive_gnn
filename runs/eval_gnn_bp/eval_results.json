@@ -1,0 +1,23 @@
+{
+  "code": {
+    "n": 72,
+    "mx": 36,
+    "mz": 36
+  },
+  "test_shots": 200,
+  "bp": {
+    "errors": 200,
+    "ler": 1.0,
+    "ler_ci_low": 0.9811546736227335,
+    "ler_ci_high": 1.0,
+    "convergence_rate": 0.0
+  },
+  "gnn_bp": {
+    "errors": 200,
+    "ler": 1.0,
+    "ler_ci_low": 0.9811546736227335,
+    "ler_ci_high": 1.0,
+    "convergence_rate": 0.0
+  },
+  "improvement_pct": 0.0
+}

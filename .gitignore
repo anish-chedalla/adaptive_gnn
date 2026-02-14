@@ -1,0 +1,11 @@
+# Python virtual environment
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+
+# Typo files noticed in your folder
+=2.2.8
+nul
+tmpclaude*
