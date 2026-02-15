@@ -79,10 +79,6 @@ python -c "import torch; print('torch:', torch.__version__); print('cuda_availab
 pip install -e .
 python -m tests.test_imports
 
-# If pytest is used in this repo:
-pytest -q
-mkdir data -ErrorAction SilentlyContinue
-
 # Biased circuit-level (faults on gates/idle/meas/reset)
 python -m astra_stim.sample_syndromes `
   --d 6 --rounds 10 --noise biased_circuit --p 0.01 --eta 20 `
