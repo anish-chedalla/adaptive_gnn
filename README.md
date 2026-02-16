@@ -63,84 +63,62 @@ python sample_syndromes.py --d 6 --noise biased_circuit --p 0.01 --eta 20 --shot
 
 ```bash
 # INITIALIZATION
-# =========================
-# 0) Enter repo root + sanity
-# =========================
-cd "C:\path\to\QLDPC_Pipeline_2"   # <-- CHANGE THIS
-
 python --version
-git status
 
-# GPU visibility (must show a GPU)
-nvidia-smi
+python -c "import torch; print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available()); print('cuda', torch.version.cuda); print('gpu', torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"
 
-# =========================
-# 1) Clean venv
-# =========================
-if (Test-Path ".venv") { Remove-Item -Recurse -Force ".venv" }
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip wheel setuptools
+pip install -e .
+python -m tests.test_imports
 
-# =========================
-# 2) Install PyTorch WITH CUDA
-# Pick ONE of these. Prefer cu121 unless driver is ancient.
-# =========================
 
-# Option A: CUDA 12.1 wheels (recommended)
-python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-```
 ```bash 
  
-1️⃣ Generate Static Code-Capacity Data
-
+Generate code-capacity datasets (static + multiple drift models)
 
 mkdir data -ErrorAction SilentlyContinue
 
+# Static (no drift)
 python -m gnn_pipeline.generate_codecap `
   --code 72_12_6 `
   --p 0.03 `
   --eta 20 `
-  --shots 20000 `
+  --shots 50000 `
   --drift_model none `
   --seed 42 `
   --out .\data\codecap_static_72_p003.npz
 
-2️⃣ Generate Drifting (Sine) Code-Capacity
-
+# Sine drift
 python -m gnn_pipeline.generate_codecap `
   --code 72_12_6 `
   --p 0.03 `
   --eta 20 `
-  --shots 20000 `
+  --shots 50000 `
   --drift_model sine `
   --drift_amp 0.5 `
   --drift_period 1000 `
   --seed 42 `
   --out .\data\codecap_drift_sine_72.npz
 
-3️⃣ Generate OU Drift
-
+# Ornstein–Uhlenbeck drift
 python -m gnn_pipeline.generate_codecap `
   --code 72_12_6 `
   --p 0.03 `
   --eta 20 `
-  --shots 20000 `
+  --shots 50000 `
   --drift_model ou `
   --drift_amp 0.5 `
   --drift_period 1000 `
-  --ou_theta 0.01 `
-  --ou_sigma 0.005 `
+  --ou_theta 0.05 `
+  --ou_sigma 0.02 `
   --seed 42 `
   --out .\data\codecap_drift_ou_72.npz
 
-4️⃣ Generate Random Telegraph Noise (RTN)
-
+# Random telegraph noise drift
 python -m gnn_pipeline.generate_codecap `
   --code 72_12_6 `
   --p 0.03 `
   --eta 20 `
-  --shots 20000 `
+  --shots 50000 `
   --drift_model rtn `
   --drift_amp 0.5 `
   --drift_period 1000 `
@@ -149,65 +127,91 @@ python -m gnn_pipeline.generate_codecap `
   --seed 42 `
   --out .\data\codecap_drift_rtn_72.npz
 
-
-Build Dataset
-
+3) Build PyG datasets (selfsup + supervised)
+# Self-supervised dataset
 python -m gnn_pipeline.build_dataset `
   --in_glob ".\data\codecap_drift_sine_72.npz" `
   --mode selfsup `
   --W 4 `
   --out ".\data\graph_selfsup_sine_W4.pt"
 
-
-Supervised:
-
+# Supervised dataset
 python -m gnn_pipeline.build_dataset `
   --in_glob ".\data\codecap_drift_sine_72.npz" `
   --mode supervised `
   --W 4 `
   --out ".\data\graph_supervised_sine_W4.pt"
 
-Train (GPU)
+# Verify it loads and has splits
+python -c "import torch; obj=torch.load(r'.\data\graph_selfsup_sine_W4.pt', weights_only=False); print(obj.keys()); print('train',len(obj['train']),'val',len(obj['val']),'test',len(obj['test']))"
 
+4) Train self-supervised (checkpoint must appear)
 mkdir runs -ErrorAction SilentlyContinue
+
 python -m gnn_pipeline.train_selfsupervised `
   --in_glob ".\data\codecap_drift_sine_72.npz" `
   --W 4 `
-  --epochs 5 `
+  --epochs 20 `
   --batch_size 128 `
-  --out_dir ".\runs\selfsup_gpu"
+  --out_dir ".\runs\selfsup_sine_W4_gpu"
 
+dir .\runs\selfsup_sine_W4_gpu
+# Must include: best_model.pt
 
-Then:
-
-
+5) Train supervised (uses BP-in-the-loop) with correct pretrained path
 python -m gnn_pipeline.train_supervised `
   --in_glob ".\data\codecap_drift_sine_72.npz" `
   --W 4 `
-  --epochs 3 `
+  --epochs 10 `
   --batch_size 64 `
-  --out_dir ".\runs\sup_gpu" `
-  --pretrained ".\runs\selfsup_gpu\model_best.pt"
+  --out_dir ".\runs\sup_sine_W4_gpu" `
+  --pretrained ".\runs\selfsup_sine_W4_gpu\best_model.pt"
 
+6) Evaluate: BP vs GNN-BP on multiple test sets (static + drift variants)
+# Static test
+python -m gnn_pipeline.evaluate `
+  --test_npz ".\data\codecap_static_72_p003.npz" `
+  --out_dir ".\runs\eval_static_bp"
 
+python -m gnn_pipeline.evaluate `
+  --test_npz ".\data\codecap_static_72_p003.npz" `
+  --gnn_model ".\runs\sup_sine_W4_gpu\best_model.pt" `
+  --out_dir ".\runs\eval_static_gnn"
 
-Evaluate
-
-
-Baseline:
-
+# Sine drift test
+python -m gnn_pipeline.evaluate `
+  --test_npz ".\data\codecap_drift_sine_72.npz" `
+  --out_dir ".\runs\eval_sine_bp"
 
 python -m gnn_pipeline.evaluate `
   --test_npz ".\data\codecap_drift_sine_72.npz" `
-  --out_dir ".\runs\eval_bp"
+  --gnn_model ".\runs\sup_sine_W4_gpu\best_model.pt" `
+  --out_dir ".\runs\eval_sine_gnn"
 
-GNN-assisted:
-
+# OU drift test (generalization)
 python -m gnn_pipeline.evaluate `
-  --test_npz ".\data\codecap_drift_sine_72.npz" `
-  --gnn_model ".\runs\sup_gpu\model_best.pt" `
-  --out_dir ".\runs\eval_gnn"
+  --test_npz ".\data\codecap_drift_ou_72.npz" `
+  --gnn_model ".\runs\sup_sine_W4_gpu\best_model.pt" `
+  --out_dir ".\runs\eval_ou_gnn"
 
+# RTN drift test (generalization)
+python -m gnn_pipeline.evaluate `
+  --test_npz ".\data\codecap_drift_rtn_72.npz" `
+  --gnn_model ".\runs\sup_sine_W4_gpu\best_model.pt" `
+  --out_dir ".\runs\eval_rtn_gnn"
+
+
+What “success” looks like (minimum):
+
+All tests pass.
+
+Training produces best_model.pt.
+
+Evaluation produces JSON outputs and does not crash.
+
+GNN-BP doesn’t tank convergence vs BP.
+
+Ideally: GNN-BP improves LER on drift, and doesn’t overfit only to sine.
 ```
 ## Full Pipeline Smoke Test (PowerShell)
 
