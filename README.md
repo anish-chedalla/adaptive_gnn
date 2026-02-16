@@ -42,7 +42,7 @@ python sample_syndromes.py --d 6 --noise biased_circuit --p 0.01 --eta 20 --shot
 ```
 
 ## Parameters
-
+```
 - `--d`: Code distance (6, 10, 12, 18, 24, or 34)
 - `--rounds`: Number of measurement rounds (default: same as d)
 - `--basis`: Measure data qubits in x or z basis (default: z)
@@ -58,6 +58,33 @@ python sample_syndromes.py --d 6 --noise biased_circuit --p 0.01 --eta 20 --shot
 - `--drift_period_ticks`: Period of drift in measurement rounds
 
 ## Anish Runs: 
+# =========================
+# 0) Enter repo root + sanity
+# =========================
+cd "C:\path\to\QLDPC_Pipeline_2"   # <-- CHANGE THIS
+
+python --version
+git status
+
+# GPU visibility (must show a GPU)
+nvidia-smi
+
+# =========================
+# 1) Clean venv
+# =========================
+if (Test-Path ".venv") { Remove-Item -Recurse -Force ".venv" }
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip wheel setuptools
+
+# =========================
+# 2) Install PyTorch WITH CUDA
+# Pick ONE of these. Prefer cu121 unless driver is ancient.
+# =========================
+
+# Option A: CUDA 12.1 wheels (recommended)
+python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
 ```bash 
  
 1️⃣ Generate Static Code-Capacity Data
