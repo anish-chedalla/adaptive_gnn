@@ -42,7 +42,7 @@ python sample_syndromes.py --d 6 --noise biased_circuit --p 0.01 --eta 20 --shot
 ```
 
 ## Parameters
-```
+
 - `--d`: Code distance (6, 10, 12, 18, 24, or 34)
 - `--rounds`: Number of measurement rounds (default: same as d)
 - `--basis`: Measure data qubits in x or z basis (default: z)
@@ -58,6 +58,8 @@ python sample_syndromes.py --d 6 --noise biased_circuit --p 0.01 --eta 20 --shot
 - `--drift_period_ticks`: Period of drift in measurement rounds
 
 ## Anish Runs: 
+
+```
 # =========================
 # 0) Enter repo root + sanity
 # =========================
