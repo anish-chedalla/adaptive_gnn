@@ -36,7 +36,7 @@ from torch_geometric.data import Data
 
 from gnn_pipeline.bp_decoder import MinSumBPDecoder
 from gnn_pipeline.dataset import _load_npz, _parse_meta
-from gnn_pipeline.gnn_model import TannerGNN
+from gnn_pipeline.gnn_model import TannerGNN, apply_correction
 from gnn_pipeline.tanner_graph import build_tanner_graph
 
 
@@ -83,6 +83,8 @@ def run_css_bp_decoder(
     n: int,
     device: torch.device,
     max_iter: int = 100,
+    dec_z_prebuilt: Optional[MinSumBPDecoder] = None,
+    dec_x_prebuilt: Optional[MinSumBPDecoder] = None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, bool]:
     """Run separate CSS BP decoding.
 
@@ -100,14 +102,16 @@ def run_css_bp_decoder(
         n: number of data qubits
         device: torch device
         max_iter: BP iterations
+        dec_z_prebuilt: optional pre-built Z-error decoder (reuse across shots)
+        dec_x_prebuilt: optional pre-built X-error decoder (reuse across shots)
 
     Returns:
         (z_errors, x_errors, z_converged, x_converged)
     """
     # Decode Z-errors using hx
     if x_syndrome.sum() > 0:
-        dec_z = MinSumBPDecoder(hx, max_iter=max_iter, alpha=0.8, clamp_llr=20.0)
-        dec_z = dec_z.to(device)
+        dec_z = dec_z_prebuilt if dec_z_prebuilt is not None else \
+            MinSumBPDecoder(hx, max_iter=max_iter, alpha=0.8, clamp_llr=20.0).to(device)
         syn_t = torch.from_numpy(x_syndrome[np.newaxis, :]).float().to(device)
         llr_t = torch.full((1, n), llr_z, dtype=torch.float32, device=device)
         _, hard_z, conv_z = dec_z(syn_t, llr_t)
@@ -119,8 +123,8 @@ def run_css_bp_decoder(
 
     # Decode X-errors using hz
     if z_syndrome.sum() > 0:
-        dec_x = MinSumBPDecoder(hz, max_iter=max_iter, alpha=0.8, clamp_llr=20.0)
-        dec_x = dec_x.to(device)
+        dec_x = dec_x_prebuilt if dec_x_prebuilt is not None else \
+            MinSumBPDecoder(hz, max_iter=max_iter, alpha=0.8, clamp_llr=20.0).to(device)
         syn_t = torch.from_numpy(z_syndrome[np.newaxis, :]).float().to(device)
         llr_t = torch.full((1, n), llr_x, dtype=torch.float32, device=device)
         _, hard_x, conv_x = dec_x(syn_t, llr_t)
@@ -144,18 +148,31 @@ def run_gnn_css_bp_decoder(
     gnn_model: nn.Module,
     device: torch.device,
     max_iter: int = 100,
+    correction_mode: str = "additive",
+    dec_z_prebuilt: Optional[MinSumBPDecoder] = None,
+    dec_x_prebuilt: Optional[MinSumBPDecoder] = None,
+    tanner_graph: Optional[Tuple] = None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, bool]:
     """Run GNN-assisted separate CSS BP decoding.
 
     The GNN provides per-qubit LLR corrections before BP runs.
+
+    Args:
+        dec_z_prebuilt: optional pre-built Z-error decoder (reuse across shots)
+        dec_x_prebuilt: optional pre-built X-error decoder (reuse across shots)
+        tanner_graph: optional pre-built (node_type_t, edge_index_t, edge_type_t)
+                      tensors on device (reuse across shots)
     """
     mx, mz = hx.shape[0], hz.shape[0]
 
-    # Build Tanner graph and node features
-    node_type_np, edge_index_np, edge_type_np = build_tanner_graph(hx, hz)
-    node_type_t = torch.from_numpy(node_type_np).long()
-    edge_index_t = torch.from_numpy(edge_index_np).long()
-    edge_type_t = torch.from_numpy(edge_type_np).long()
+    # Use cached Tanner graph or build fresh
+    if tanner_graph is not None:
+        node_type_t, edge_index_t, edge_type_t = tanner_graph
+    else:
+        node_type_np, edge_index_np, edge_type_np = build_tanner_graph(hx, hz)
+        node_type_t = torch.from_numpy(node_type_np).long().to(device)
+        edge_index_t = torch.from_numpy(edge_index_np).long().to(device)
+        edge_type_t = torch.from_numpy(edge_type_np).long().to(device)
 
     # Node features: [channel_llr, is_data, is_x_check, is_z_check]
     num_nodes = n + mx + mz
@@ -170,26 +187,35 @@ def run_gnn_css_bp_decoder(
 
     data_obj = Data(
         x=x_feat.to(device),
-        edge_index=edge_index_t.to(device),
-        edge_type=edge_type_t.to(device),
-        node_type=node_type_t.to(device),
+        edge_index=edge_index_t,
+        edge_type=edge_type_t,
+        node_type=node_type_t,
         channel_llr=torch.full((n,), avg_llr, dtype=torch.float32).to(device),
     )
 
-    # Get GNN corrections
+    # Get GNN corrections and apply based on mode
     with torch.no_grad():
         gnn_model.eval()
-        llr_corrections = gnn_model(data_obj)
-    llr_corrections = torch.clamp(llr_corrections, -20.0, 20.0).cpu().numpy()
+        gnn_out = gnn_model(data_obj)
 
-    # Apply corrections to both decoders
-    corrected_llr_z = llr_z + llr_corrections
-    corrected_llr_x = llr_x + llr_corrections
+    llr_z_t = torch.full((n,), llr_z, dtype=torch.float32, device=device)
+    llr_x_t = torch.full((n,), llr_x, dtype=torch.float32, device=device)
+
+    if correction_mode == "both":
+        add_corr, mul_corr = gnn_out
+        add_corr = torch.clamp(add_corr, -20.0, 20.0)
+        mul_corr = torch.clamp(mul_corr, -5.0, 5.0)
+        gnn_out = (add_corr, mul_corr)
+    else:
+        gnn_out = torch.clamp(gnn_out, -20.0, 20.0)
+
+    corrected_llr_z = apply_correction(llr_z_t, gnn_out, correction_mode).cpu().numpy()
+    corrected_llr_x = apply_correction(llr_x_t, gnn_out, correction_mode).cpu().numpy()
 
     # Decode Z-errors using hx with corrected LLRs
     if x_syndrome.sum() > 0:
-        dec_z = MinSumBPDecoder(hx, max_iter=max_iter, alpha=0.8, clamp_llr=20.0)
-        dec_z = dec_z.to(device)
+        dec_z = dec_z_prebuilt if dec_z_prebuilt is not None else \
+            MinSumBPDecoder(hx, max_iter=max_iter, alpha=0.8, clamp_llr=20.0).to(device)
         syn_t = torch.from_numpy(x_syndrome[np.newaxis, :]).float().to(device)
         llr_t = torch.from_numpy(corrected_llr_z[np.newaxis, :]).float().to(device)
         _, hard_z, conv_z = dec_z(syn_t, llr_t)
@@ -201,8 +227,8 @@ def run_gnn_css_bp_decoder(
 
     # Decode X-errors using hz with corrected LLRs
     if z_syndrome.sum() > 0:
-        dec_x = MinSumBPDecoder(hz, max_iter=max_iter, alpha=0.8, clamp_llr=20.0)
-        dec_x = dec_x.to(device)
+        dec_x = dec_x_prebuilt if dec_x_prebuilt is not None else \
+            MinSumBPDecoder(hz, max_iter=max_iter, alpha=0.8, clamp_llr=20.0).to(device)
         syn_t = torch.from_numpy(z_syndrome[np.newaxis, :]).float().to(device)
         llr_t = torch.from_numpy(corrected_llr_x[np.newaxis, :]).float().to(device)
         _, hard_x, conv_x = dec_x(syn_t, llr_t)
@@ -246,6 +272,7 @@ def evaluate_code_capacity(
     gnn_model: Optional[nn.Module] = None,
     use_bposd: bool = False,
     use_mwpm: bool = False,
+    correction_mode: str = "additive",
 ) -> dict:
     """Evaluate decoders in code-capacity mode (separate CSS decoding).
 
@@ -311,6 +338,22 @@ def evaluate_code_capacity(
         except ImportError as e:
             print(f"Warning: MWPM not available: {e}")
 
+    # Pre-build BP decoders (reused across all shots -- major speedup)
+    print("Pre-building BP decoders...")
+    dec_z_pre = MinSumBPDecoder(hx, max_iter=100, alpha=0.8, clamp_llr=20.0).to(device)
+    dec_x_pre = MinSumBPDecoder(hz, max_iter=100, alpha=0.8, clamp_llr=20.0).to(device)
+
+    # Pre-build Tanner graph for GNN (reused across all shots)
+    tanner_cache = None
+    if gnn_model is not None:
+        print("Pre-building Tanner graph...")
+        node_type_np, edge_index_np, edge_type_np = build_tanner_graph(hx, hz)
+        tanner_cache = (
+            torch.from_numpy(node_type_np).long().to(device),
+            torch.from_numpy(edge_index_np).long().to(device),
+            torch.from_numpy(edge_type_np).long().to(device),
+        )
+
     # Run evaluation
     print("\nEvaluating...")
     t_start = time.time()
@@ -339,7 +382,8 @@ def evaluate_code_capacity(
 
         # --- BP (separate CSS decoding) ---
         z_err, x_err, z_conv, x_conv = run_css_bp_decoder(
-            x_syndrome, z_syndrome, hx, hz, llr_z, llr_x, n, device
+            x_syndrome, z_syndrome, hx, hz, llr_z, llr_x, n, device,
+            dec_z_prebuilt=dec_z_pre, dec_x_prebuilt=dec_x_pre,
         )
         both_conv = z_conv and x_conv
         bp_converged += int(both_conv)
@@ -350,7 +394,9 @@ def evaluate_code_capacity(
         if gnn_model is not None:
             z_err_g, x_err_g, z_conv_g, x_conv_g = run_gnn_css_bp_decoder(
                 x_syndrome, z_syndrome, hx, hz, llr_z, llr_x, n,
-                gnn_model, device
+                gnn_model, device, correction_mode=correction_mode,
+                dec_z_prebuilt=dec_z_pre, dec_x_prebuilt=dec_x_pre,
+                tanner_graph=tanner_cache,
             )
             both_conv_g = z_conv_g and x_conv_g
             gnn_bp_converged += int(both_conv_g)
@@ -671,6 +717,7 @@ def main(argv: List[str] | None = None) -> int:
 
     # Load GNN model if provided (code_capacity mode only)
     gnn_model_inst = None
+    gnn_correction_mode = "additive"
     if args.gnn_model:
         if args.mode == "circuit_level":
             print("Warning: GNN model not supported in circuit_level mode (ignored)")
@@ -678,13 +725,16 @@ def main(argv: List[str] | None = None) -> int:
             print(f"Loading GNN model from {args.gnn_model}...")
             checkpoint = torch.load(args.gnn_model, map_location=device, weights_only=True)
             if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                gnn_correction_mode = checkpoint.get("correction_mode", "additive")
                 gnn_model_inst = TannerGNN(
                     hidden_dim=checkpoint.get("hidden_dim", 64),
                     num_mp_layers=checkpoint.get("num_mp_layers", 3),
+                    correction_mode=gnn_correction_mode,
                 )
                 gnn_model_inst.load_state_dict(checkpoint["model_state_dict"])
                 print(f"  Loaded checkpoint (hidden_dim={checkpoint.get('hidden_dim', 64)}, "
-                      f"num_mp_layers={checkpoint.get('num_mp_layers', 3)})")
+                      f"num_mp_layers={checkpoint.get('num_mp_layers', 3)}, "
+                      f"correction_mode={gnn_correction_mode})")
             else:
                 gnn_model_inst = TannerGNN()
                 gnn_model_inst.load_state_dict(checkpoint)
@@ -698,6 +748,7 @@ def main(argv: List[str] | None = None) -> int:
             gnn_model=gnn_model_inst,
             use_bposd=args.bposd,
             use_mwpm=args.mwpm,
+            correction_mode=gnn_correction_mode,
         )
     elif args.mode == "circuit_level":
         results = evaluate_circuit_level(

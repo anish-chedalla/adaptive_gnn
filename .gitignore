@@ -1,14 +1,33 @@
-# Python virtual environment
+# Python
 .venv/
 venv/
 ENV/
 __pycache__/
 *.py[cod]
+*.egg-info/
+dist/
+build/
 
-# Typo files noticed in your folder
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+
+# Claude Code
+.claude/
+
+# Runs and experiment outputs
+runs/
+
+# Data artifacts (keep small reference data only)
+data/graph_*.pt
+data/graph_*_meta.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
 =2.2.8
 nul
 tmpclaude*
-
-# VS Code
-.vscode/

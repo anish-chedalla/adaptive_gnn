@@ -186,9 +186,9 @@ def build_graph_dataset(
 
                 data_obj = Data(
                     x=x_feat,
-                    edge_index=edge_index_t.clone(),
-                    edge_type=edge_type_t.clone(),
-                    node_type=node_type_t.clone(),
+                    edge_index=edge_index_t,
+                    edge_type=edge_type_t,
+                    node_type=node_type_t,
                     channel_llr=shot_channel_llr.clone(),
                     window_syndromes=window_t,
                     target_syndrome=torch.from_numpy(target_syn.copy()).float(),

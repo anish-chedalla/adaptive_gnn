@@ -62,6 +62,9 @@ def _decode_all_shots(
         Dictionary with keys like 'bp', 'gnn_bp', 'bposd', each containing
         'errors', 'convergences', 'shots'.
     """
+    from gnn_pipeline.bp_decoder import MinSumBPDecoder
+    from gnn_pipeline.tanner_graph import build_tanner_graph
+
     mx, n = hx.shape
     mz = hz.shape[0]
     shots = syndromes.shape[0]
@@ -73,6 +76,20 @@ def _decode_all_shots(
     px_c = max(min(px, 1.0 - 1e-7), 1e-7)
     llr_z = float(math.log((1.0 - pz_c) / pz_c))
     llr_x = float(math.log((1.0 - px_c) / px_c))
+
+    # Pre-build BP decoders (reused across all shots -- major speedup)
+    dec_z_pre = MinSumBPDecoder(hx, max_iter=100, alpha=0.8, clamp_llr=20.0).to(device)
+    dec_x_pre = MinSumBPDecoder(hz, max_iter=100, alpha=0.8, clamp_llr=20.0).to(device)
+
+    # Pre-build Tanner graph for GNN (reused across all shots)
+    tanner_cache = None
+    if gnn_model is not None:
+        node_type_np, edge_index_np, edge_type_np = build_tanner_graph(hx, hz)
+        tanner_cache = (
+            torch.from_numpy(node_type_np).long().to(device),
+            torch.from_numpy(edge_index_np).long().to(device),
+            torch.from_numpy(edge_type_np).long().to(device),
+        )
 
     # Optionally load BP-OSD
     bposd_fn = None
@@ -110,7 +127,8 @@ def _decode_all_shots(
 
         # BP
         z_err, x_err, zc, xc = run_css_bp_decoder(
-            x_syn, z_syn, hx, hz, llr_z, llr_x, n, device
+            x_syn, z_syn, hx, hz, llr_z, llr_x, n, device,
+            dec_z_prebuilt=dec_z_pre, dec_x_prebuilt=dec_x_pre,
         )
         bp_converged += int(zc and xc)
         bp_errors += int(_check_logical_error(z_err, x_err, lx, lz, observable))
@@ -118,7 +136,9 @@ def _decode_all_shots(
         # GNN-BP
         if gnn_model is not None:
             z_err_g, x_err_g, zc_g, xc_g = run_gnn_css_bp_decoder(
-                x_syn, z_syn, hx, hz, llr_z, llr_x, n, gnn_model, device
+                x_syn, z_syn, hx, hz, llr_z, llr_x, n, gnn_model, device,
+                dec_z_prebuilt=dec_z_pre, dec_x_prebuilt=dec_x_pre,
+                tanner_graph=tanner_cache,
             )
             gnn_converged += int(zc_g and xc_g)
             gnn_errors += int(_check_logical_error(z_err_g, x_err_g, lx, lz, observable))
@@ -456,6 +476,23 @@ def main(argv: List[str] | None = None) -> int:
     all_results = []
     csv_rows = []
 
+    # Load partial results for resume support
+    partial_path = out_dir / "results_partial.json"
+    completed_keys = set()
+    if partial_path.exists():
+        try:
+            with open(partial_path) as f:
+                partial_data = json.load(f)
+            all_results = partial_data.get("results", [])
+            csv_rows = partial_data.get("csv_rows", [])
+            for r in all_results:
+                completed_keys.add((r["p"], r["noise_type"]))
+            print(f"Resuming: {len(completed_keys)} points already completed")
+        except (json.JSONDecodeError, KeyError):
+            print("Warning: corrupt partial results, starting fresh")
+            all_results = []
+            csv_rows = []
+
     total_combos = len(p_values) * len(noise_configs)
     combo_idx = 0
     t_total_start = time.time()
@@ -463,6 +500,11 @@ def main(argv: List[str] | None = None) -> int:
     for noise_label, drift_model in noise_configs:
         for p_val in p_values:
             combo_idx += 1
+
+            # Skip already-completed points (resume support)
+            if (float(p_val), noise_label) in completed_keys:
+                print(f"\n[{combo_idx}/{total_combos}] p={p_val:.4f}, noise={noise_label} -- SKIPPED (already done)")
+                continue
 
             if drift_model == "none":
                 drift_str = "none"
@@ -547,6 +589,14 @@ def main(argv: List[str] | None = None) -> int:
 
             all_results.append(point_result)
 
+            # Save partial results after each point (resume support)
+            partial_data = {
+                "results": all_results,
+                "csv_rows": csv_rows,
+            }
+            with open(partial_path, "w") as f:
+                json.dump(partial_data, f, indent=2)
+
             # Print summary
             for dec_name in decoded:
                 r = point_result[dec_name]
@@ -606,6 +656,10 @@ def main(argv: List[str] | None = None) -> int:
         has_bposd=args.bposd,
         has_mwpm=args.mwpm,
     )
+
+    # Clean up partial file after successful completion
+    if partial_path.exists():
+        partial_path.unlink()
 
     print("\nDone!")
     return 0

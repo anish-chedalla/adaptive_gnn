@@ -35,12 +35,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch_geometric.loader import DataLoader
 
 from gnn_pipeline.bp_decoder import MinSumBPDecoder
 from gnn_pipeline.dataset import build_graph_dataset, _load_npz
-from gnn_pipeline.gnn_model import TannerGNN
+from gnn_pipeline.gnn_model import TannerGNN, apply_correction
 from gnn_pipeline.loss_functions import weighted_bce_loss, focal_loss, logical_aware_loss
 
 
@@ -63,6 +63,7 @@ def train_epoch(
     lx_t: torch.Tensor | None = None,
     lz_t: torch.Tensor | None = None,
     accumulate_grad: int = 1,
+    correction_mode: str = "additive",
 ) -> dict:
     """Train for one epoch on supervised loss through differentiable BP.
 
@@ -84,9 +85,14 @@ def train_epoch(
         B = batch.num_graphs
 
         # GNN forward: get per-qubit LLR corrections
-        llr_corrections = model(batch)
-        llr_corrections = torch.clamp(llr_corrections, -20.0, 20.0)
-        llr_corrections = llr_corrections.view(B, n_qubits)
+        gnn_out = model(batch)
+        if correction_mode == "both":
+            add_corr, mul_corr = gnn_out
+            add_corr = torch.clamp(add_corr, -20.0, 20.0).view(B, n_qubits)
+            mul_corr = torch.clamp(mul_corr, -5.0, 5.0).view(B, n_qubits)
+            gnn_out = (add_corr, mul_corr)
+        else:
+            gnn_out = torch.clamp(gnn_out, -20.0, 20.0).view(B, n_qubits)
 
         # Reshape supervised data
         channel_llr_z = batch.channel_llr_z.view(B, n_qubits)
@@ -96,8 +102,8 @@ def train_epoch(
         target_syn = batch.target_syndrome.view(B, n_checks)
 
         # Apply GNN corrections to per-Pauli channel LLRs
-        corrected_llr_z = channel_llr_z + llr_corrections
-        corrected_llr_x = channel_llr_x + llr_corrections
+        corrected_llr_z = apply_correction(channel_llr_z, gnn_out, correction_mode)
+        corrected_llr_x = apply_correction(channel_llr_x, gnn_out, correction_mode)
 
         # Extract CSS syndromes
         x_syndrome = target_syn[:, :mx]   # X-checks detect Z-errors
@@ -191,6 +197,7 @@ def eval_epoch(
     logical_weight: float = 0.1,
     lx_t: torch.Tensor | None = None,
     lz_t: torch.Tensor | None = None,
+    correction_mode: str = "additive",
 ) -> dict:
     """Evaluate on validation/test set."""
     model.eval()
@@ -206,9 +213,14 @@ def eval_epoch(
         batch = batch.to(device)
         B = batch.num_graphs
 
-        llr_corrections = model(batch)
-        llr_corrections = torch.clamp(llr_corrections, -20.0, 20.0)
-        llr_corrections = llr_corrections.view(B, n_qubits)
+        gnn_out = model(batch)
+        if correction_mode == "both":
+            add_corr, mul_corr = gnn_out
+            add_corr = torch.clamp(add_corr, -20.0, 20.0).view(B, n_qubits)
+            mul_corr = torch.clamp(mul_corr, -5.0, 5.0).view(B, n_qubits)
+            gnn_out = (add_corr, mul_corr)
+        else:
+            gnn_out = torch.clamp(gnn_out, -20.0, 20.0).view(B, n_qubits)
 
         channel_llr_z = batch.channel_llr_z.view(B, n_qubits)
         channel_llr_x = batch.channel_llr_x.view(B, n_qubits)
@@ -216,8 +228,8 @@ def eval_epoch(
         x_error = batch.x_error.view(B, n_qubits)
         target_syn = batch.target_syndrome.view(B, n_checks)
 
-        corrected_llr_z = channel_llr_z + llr_corrections
-        corrected_llr_x = channel_llr_x + llr_corrections
+        corrected_llr_z = apply_correction(channel_llr_z, gnn_out, correction_mode)
+        corrected_llr_x = apply_correction(channel_llr_x, gnn_out, correction_mode)
 
         x_syndrome = target_syn[:, :mx]
         z_syndrome = target_syn[:, mx:]
@@ -315,6 +327,18 @@ def main(argv: List[str] | None = None) -> int:
         help="Learning rate scheduler",
     )
     parser.add_argument(
+        "--patience", type=int, default=0,
+        help="Early stopping patience in epochs (0 = disabled)",
+    )
+    parser.add_argument(
+        "--warmup_epochs", type=int, default=0,
+        help="Linear LR warmup epochs (0 = disabled)",
+    )
+    parser.add_argument(
+        "--amp", action="store_true",
+        help="Enable automatic mixed-precision training (GPU only)",
+    )
+    parser.add_argument(
         "--pretrained", type=str, default=None,
         help="Path to pretrained model (self-supervised checkpoint)",
     )
@@ -329,6 +353,19 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument(
         "--num_mp_layers", type=int, default=3,
         help="Number of GNN message-passing layers",
+    )
+    parser.add_argument(
+        "--correction_mode", type=str, default="additive",
+        choices=["additive", "multiplicative", "both"],
+        help="How GNN corrections are applied to channel LLRs",
+    )
+    parser.add_argument(
+        "--use_residual", action="store_true",
+        help="Enable residual/skip connections in GNN message-passing layers",
+    )
+    parser.add_argument(
+        "--use_layer_norm", action="store_true",
+        help="Enable layer normalization in GNN message-passing layers",
     )
     parser.add_argument(
         "--out_dir", type=str, required=True,
@@ -415,6 +452,7 @@ def main(argv: List[str] | None = None) -> int:
     model = TannerGNN(
         hidden_dim=args.hidden_dim,
         num_mp_layers=args.num_mp_layers,
+        correction_mode=args.correction_mode,
     )
 
     if args.pretrained and not args.from_scratch:
@@ -436,19 +474,56 @@ def main(argv: List[str] | None = None) -> int:
     optimizer = Adam(model.parameters(), lr=args.lr)
     scheduler = None
     if args.scheduler == "cosine":
-        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
-        print(f"Using cosine LR scheduler: {args.lr} -> {args.lr * 0.01}")
+        if args.warmup_epochs > 0:
+            warmup_sched = LinearLR(
+                optimizer, start_factor=0.01, end_factor=1.0,
+                total_iters=args.warmup_epochs,
+            )
+            cosine_sched = CosineAnnealingLR(
+                optimizer, T_max=max(1, args.epochs - args.warmup_epochs),
+                eta_min=args.lr * 0.01,
+            )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_sched, cosine_sched],
+                milestones=[args.warmup_epochs],
+            )
+            print(f"Using cosine LR scheduler with {args.warmup_epochs}-epoch warmup: "
+                  f"{args.lr * 0.01:.2e} -> {args.lr} -> {args.lr * 0.01:.2e}")
+        else:
+            scheduler = CosineAnnealingLR(
+                optimizer, T_max=args.epochs, eta_min=args.lr * 0.01,
+            )
+            print(f"Using cosine LR scheduler: {args.lr} -> {args.lr * 0.01}")
+
+    # Mixed-precision setup
+    use_amp = args.amp and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
+    if use_amp:
+        print("Mixed-precision training enabled (AMP)")
+    elif args.amp:
+        print("AMP requested but CUDA not available, using fp32")
 
     # Create output directory
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Test loader (evaluated once after training on best model)
+    test_loader = None
+    if len(test_data) > 0:
+        test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False)
+        print(f"Test set: {len(test_data)} samples (evaluated after training)")
+
     # Training loop
-    print(f"\nTraining for {args.epochs} epochs (loss={args.loss}, bp_iters={args.bp_iters})...")
+    patience_str = f", patience={args.patience}" if args.patience > 0 else ""
+    print(f"\nTraining for {args.epochs} epochs (loss={args.loss}, bp_iters={args.bp_iters}{patience_str})...")
     print("-" * 90)
     best_val_loss = float("inf")
+    patience_counter = 0
     history = []
     t_start = time.time()
+    early_stopped = False
+    epochs_completed = 0
 
     for epoch in range(args.epochs):
         t_epoch = time.time()
@@ -463,6 +538,7 @@ def main(argv: List[str] | None = None) -> int:
             logical_weight=args.logical_weight,
             lx_t=lx_t, lz_t=lz_t,
             accumulate_grad=args.accumulate_grad,
+            correction_mode=args.correction_mode,
         )
         val_metrics = eval_epoch(
             model, val_loader, device,
@@ -473,6 +549,7 @@ def main(argv: List[str] | None = None) -> int:
             focal_gamma=args.focal_gamma,
             logical_weight=args.logical_weight,
             lx_t=lx_t, lz_t=lz_t,
+            correction_mode=args.correction_mode,
         )
 
         if scheduler is not None:
@@ -502,6 +579,7 @@ def main(argv: List[str] | None = None) -> int:
         # Save best model
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
+            patience_counter = 0
 
             # Raw state dict (backward-compatible with evaluate.py)
             torch.save(model.state_dict(), str(out_dir / "best_model.pt"))
@@ -512,6 +590,7 @@ def main(argv: List[str] | None = None) -> int:
                 "hidden_dim": args.hidden_dim,
                 "num_mp_layers": args.num_mp_layers,
                 "node_feat_dim": 4, "edge_types": 2, "dropout": 0.1,
+                "correction_mode": args.correction_mode,
                 "bp_iters": args.bp_iters,
                 "loss_fn": args.loss,
                 "epoch": epoch + 1,
@@ -519,10 +598,21 @@ def main(argv: List[str] | None = None) -> int:
             }, str(out_dir / "best_checkpoint.pt"))
 
             print(f"  -> New best val loss: {best_val_loss:.6f}")
+        else:
+            patience_counter += 1
+            if args.patience > 0 and patience_counter >= args.patience:
+                print(f"  Early stopping: no improvement for {args.patience} epochs")
+                early_stopped = True
+                epochs_completed = epoch + 1
+                break
+
+        epochs_completed = epoch + 1
 
     total_time = time.time() - t_start
     print("-" * 90)
-    print(f"Training complete in {total_time:.1f}s ({total_time/60:.1f} min)")
+    stop_reason = "early stopping" if early_stopped else "completed"
+    print(f"Training {stop_reason} in {total_time:.1f}s ({total_time/60:.1f} min), "
+          f"{epochs_completed}/{args.epochs} epochs")
     print(f"Best validation loss: {best_val_loss:.6f}")
 
     # Save final model
@@ -531,8 +621,33 @@ def main(argv: List[str] | None = None) -> int:
         "model_state_dict": model.state_dict(),
         "hidden_dim": args.hidden_dim,
         "num_mp_layers": args.num_mp_layers,
-        "epoch": args.epochs,
+        "epoch": epochs_completed,
     }, str(out_dir / "final_checkpoint.pt"))
+
+    # Test-set evaluation on best model
+    test_metrics = None
+    if test_loader is not None:
+        print("\nEvaluating best model on test set...")
+        best_ckpt_path = out_dir / "best_checkpoint.pt"
+        if best_ckpt_path.exists():
+            best_ckpt = torch.load(str(best_ckpt_path), map_location=device, weights_only=True)
+            model.load_state_dict(best_ckpt["model_state_dict"])
+        test_metrics = eval_epoch(
+            model, test_loader, device,
+            dec_z, dec_x, n_qubits, mx, mz,
+            loss_fn=args.loss,
+            pos_weight=args.pos_weight,
+            focal_alpha=args.focal_alpha,
+            focal_gamma=args.focal_gamma,
+            logical_weight=args.logical_weight,
+            lx_t=lx_t, lz_t=lz_t,
+            correction_mode=args.correction_mode,
+        )
+        print(
+            f"Test Loss: {test_metrics['loss']:.6f} | "
+            f"BitAcc Z: {test_metrics['bit_acc_z']:.4f} X: {test_metrics['bit_acc_x']:.4f} | "
+            f"Conv Z: {test_metrics['convergence_z']:.3f} X: {test_metrics['convergence_x']:.3f}"
+        )
 
     # Save training log
     log = {
@@ -542,23 +657,32 @@ def main(argv: List[str] | None = None) -> int:
         "num_mp_layers": args.num_mp_layers,
         "num_params": n_params,
         "num_epochs": args.epochs,
+        "epochs_completed": epochs_completed,
+        "early_stopped": early_stopped,
+        "patience": args.patience,
+        "warmup_epochs": args.warmup_epochs,
         "batch_size": args.batch_size,
         "learning_rate": args.lr,
         "loss_fn": args.loss,
         "bp_iters": args.bp_iters,
         "grad_clip": args.grad_clip,
         "scheduler": args.scheduler,
+        "correction_mode": args.correction_mode,
+        "accumulate_grad": args.accumulate_grad,
         "pretrained": args.pretrained,
         "from_scratch": args.from_scratch,
         "seed": args.seed,
         "W": args.W,
         "num_train": len(train_data),
         "num_val": len(val_data),
+        "num_test": len(test_data),
         "source_files": [str(p) for p in npz_paths],
         "best_val_loss": best_val_loss,
         "total_time_s": total_time,
         "history": history,
     }
+    if test_metrics is not None:
+        log["test_metrics"] = test_metrics
 
     log_path = out_dir / "training_log.json"
     with open(log_path, "w") as f:

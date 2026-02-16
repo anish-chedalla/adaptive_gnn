@@ -78,6 +78,9 @@ def _config_name(idx: int, cfg: dict) -> str:
     """Generate a short name for a config."""
     parts = [f"h{cfg['hidden_dim']}", f"l{cfg['num_mp_layers']}",
              f"bp{cfg['bp_iters']}", cfg["loss"]]
+    cm = cfg.get("correction_mode", "additive")
+    if cm != "additive":
+        parts.append(cm[:3])  # mul or bot
     if cfg.get("pretrained"):
         parts.append("pt")
     else:
@@ -109,6 +112,7 @@ def _run_training(
         "--epochs", str(epochs),
         "--batch_size", str(batch_size),
         "--lr", str(lr),
+        "--correction_mode", cfg.get("correction_mode", "additive"),
         "--scheduler", "cosine",
         "--out_dir", str(run_dir),
     ]
@@ -151,10 +155,14 @@ def _run_evaluation(
 ) -> bool:
     """Run evaluation for one config."""
     run_dir = out_dir / config_name
-    model_path = run_dir / "best_model.pt"
+
+    # Prefer rich checkpoint (has correction_mode metadata)
+    model_path = run_dir / "best_checkpoint.pt"
+    if not model_path.exists():
+        model_path = run_dir / "best_model.pt"
 
     if not model_path.exists():
-        print(f"  No model at {model_path}, skipping evaluation")
+        print(f"  No model at {run_dir}, skipping evaluation")
         return False
 
     eval_dir = run_dir / "eval"
@@ -194,24 +202,38 @@ def _collect_results(configs: list, config_names: list, out_dir: pathlib.Path) -
     for cfg, name in zip(configs, config_names):
         run_dir = out_dir / name
 
-        # Read training results
-        train_log = run_dir / "train_log.txt"
+        # Read training results (prefer structured JSON over text parsing)
         train_loss = None
         val_loss = None
-        if train_log.exists():
-            text = train_log.read_text(errors="replace")
-            # Parse last epoch's train/val loss from log
-            for line in reversed(text.splitlines()):
-                if "train_loss=" in line and train_loss is None:
-                    try:
-                        train_loss = float(line.split("train_loss=")[1].split(",")[0].split()[0])
-                    except (ValueError, IndexError):
-                        pass
-                if "val_loss=" in line and val_loss is None:
-                    try:
-                        val_loss = float(line.split("val_loss=")[1].split(",")[0].split()[0])
-                    except (ValueError, IndexError):
-                        pass
+        training_json = run_dir / "training_log.json"
+        if training_json.exists():
+            try:
+                with open(training_json) as f:
+                    log_data = json.load(f)
+                history = log_data.get("history", [])
+                if history:
+                    last_epoch = history[-1]
+                    train_loss = last_epoch.get("train", {}).get("loss")
+                    val_loss = last_epoch.get("val", {}).get("loss")
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass
+
+        # Fallback: parse train_log.txt if JSON not available
+        if train_loss is None or val_loss is None:
+            train_log = run_dir / "train_log.txt"
+            if train_log.exists():
+                text = train_log.read_text(errors="replace")
+                for line in reversed(text.splitlines()):
+                    if "Train Loss:" in line and train_loss is None:
+                        try:
+                            train_loss = float(line.split("Train Loss:")[1].split("|")[0].strip())
+                        except (ValueError, IndexError):
+                            pass
+                    if "Val Loss:" in line and val_loss is None:
+                        try:
+                            val_loss = float(line.split("Val Loss:")[1].split("|")[0].strip())
+                        except (ValueError, IndexError):
+                            pass
 
         # Read eval results
         eval_results_path = run_dir / "eval" / "eval_results.json"
@@ -236,6 +258,7 @@ def _collect_results(configs: list, config_names: list, out_dir: pathlib.Path) -
             "num_mp_layers": cfg["num_mp_layers"],
             "bp_iters": cfg["bp_iters"],
             "loss": cfg["loss"],
+            "correction_mode": cfg.get("correction_mode", "additive"),
             "pretrained": cfg.get("pretrained", False),
             "train_loss": f"{train_loss:.6f}" if train_loss is not None else "N/A",
             "val_loss": f"{val_loss:.6f}" if val_loss is not None else "N/A",

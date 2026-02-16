@@ -36,10 +36,21 @@ def apply_correction(channel_llr: torch.Tensor, gnn_output, mode: str) -> torch.
 
 
 class TypedMessagePassingLayer(nn.Module):
-    """Single message-passing layer with edge-type-specific transforms."""
+    """Single message-passing layer with edge-type-specific transforms.
 
-    def __init__(self, hidden_dim: int, edge_types: int, dropout: float = 0.1):
+    Supports optional residual connections and layer normalization.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        edge_types: int,
+        dropout: float = 0.1,
+        use_residual: bool = False,
+        use_layer_norm: bool = False,
+    ):
         super().__init__()
+        self.use_residual = use_residual
         self.edge_mlps = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(2 * hidden_dim, hidden_dim),
@@ -50,6 +61,7 @@ class TypedMessagePassingLayer(nn.Module):
             for _ in range(edge_types)
         ])
         self.gru = nn.GRUCell(hidden_dim, hidden_dim)
+        self.layer_norm = nn.LayerNorm(hidden_dim) if use_layer_norm else None
 
     def forward(
         self,
@@ -84,6 +96,15 @@ class TypedMessagePassingLayer(nn.Module):
 
         # GRU update
         x_new = self.gru(agg, x)
+
+        # Optional residual connection (same dim, no new params)
+        if self.use_residual:
+            x_new = x_new + x
+
+        # Optional layer normalization
+        if self.layer_norm is not None:
+            x_new = self.layer_norm(x_new)
+
         return x_new
 
 
@@ -104,11 +125,15 @@ class TannerGNN(nn.Module):
         edge_types: int = 2,
         dropout: float = 0.1,
         correction_mode: str = "additive",
+        use_residual: bool = False,
+        use_layer_norm: bool = False,
     ):
         super().__init__()
         self.node_feat_dim = node_feat_dim
         self.hidden_dim = hidden_dim
         self.correction_mode = correction_mode
+        self.use_residual = use_residual
+        self.use_layer_norm = use_layer_norm
 
         # Input projection
         self.input_proj = nn.Sequential(
@@ -119,7 +144,11 @@ class TannerGNN(nn.Module):
 
         # Message passing layers
         self.mp_layers = nn.ModuleList([
-            TypedMessagePassingLayer(hidden_dim, edge_types, dropout)
+            TypedMessagePassingLayer(
+                hidden_dim, edge_types, dropout,
+                use_residual=use_residual,
+                use_layer_norm=use_layer_norm,
+            )
             for _ in range(num_mp_layers)
         ])
 

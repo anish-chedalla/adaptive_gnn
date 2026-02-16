@@ -118,7 +118,8 @@ def logical_aware_loss(
         # Where logical has support, use factor; elsewhere use 1.0
         masked = factor * log_mask + (1.0 - log_mask)
         prod_val = masked.prod(dim=2)  # (B, k)
-        return 0.5 * (1.0 - prod_val)  # (B, k)
+        flip_prob = 0.5 * (1.0 - prod_val)  # (B, k)
+        return flip_prob.clamp(0.0, 1.0)
 
     # Ground-truth logical flips
     gt_z_flip = (targets_z.unsqueeze(1) * lx.unsqueeze(0).float()).sum(dim=2) % 2  # (B, k)

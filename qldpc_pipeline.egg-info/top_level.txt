@@ -1,4 +1,0 @@
-astra_stim
-codes
-gnn_pipeline
-tests
