@@ -58,12 +58,144 @@ python sample_syndromes.py --d 6 --noise biased_circuit --p 0.01 --eta 20 --shot
 - `--drift_period_ticks`: Period of drift in measurement rounds
 
 ## Anish Runs: 
+```bash 
+ 
+1️⃣ Generate Static Code-Capacity Data
 
-pip install -e .
-python -m tests.test_imports
+For your 72-qubit BB code:
+
+mkdir data -ErrorAction SilentlyContinue
+
+python -m gnn_pipeline.generate_codecap `
+  --code 72_12_6 `
+  --p 0.03 `
+  --eta 20 `
+  --shots 20000 `
+  --drift_model none `
+  --seed 42 `
+  --out .\data\codecap_static_72_p003.npz
+
+2️⃣ Generate Drifting (Sine) Code-Capacity
+python -m gnn_pipeline.generate_codecap `
+  --code 72_12_6 `
+  --p 0.03 `
+  --eta 20 `
+  --shots 20000 `
+  --drift_model sine `
+  --drift_amp 0.5 `
+  --drift_period 1000 `
+  --seed 42 `
+  --out .\data\codecap_drift_sine_72.npz
+
+3️⃣ Generate OU Drift
+python -m gnn_pipeline.generate_codecap `
+  --code 72_12_6 `
+  --p 0.03 `
+  --eta 20 `
+  --shots 20000 `
+  --drift_model ou `
+  --drift_amp 0.5 `
+  --drift_period 1000 `
+  --ou_theta 0.01 `
+  --ou_sigma 0.005 `
+  --seed 42 `
+  --out .\data\codecap_drift_ou_72.npz
+
+4️⃣ Generate Random Telegraph Noise (RTN)
+python -m gnn_pipeline.generate_codecap `
+  --code 72_12_6 `
+  --p 0.03 `
+  --eta 20 `
+  --shots 20000 `
+  --drift_model rtn `
+  --drift_amp 0.5 `
+  --drift_period 1000 `
+  --rtn_delta 0.01 `
+  --rtn_switch 0.001 `
+  --seed 42 `
+  --out .\data\codecap_drift_rtn_72.npz
+
+🧠 Why This Happened
+
+Your CLI defines:
+
+--code
+--drift_model
 
 
+So PowerShell saw --d and tried to match it to:
 
+--drift_model
+
+--drift_amp
+
+--drift_period
+
+That’s why you got:
+
+error: ambiguous option: --d
+
+
+This is good — it means argparse strict parsing is working.
+
+🔬 Now Continue Full GPU Test Flow
+
+Once data exists:
+
+Build Dataset
+python -m gnn_pipeline.build_dataset `
+  --in_glob ".\data\codecap_drift_sine_72.npz" `
+  --mode selfsup `
+  --W 4 `
+  --out ".\data\graph_selfsup_sine_W4.pt"
+
+
+Supervised:
+
+python -m gnn_pipeline.build_dataset `
+  --in_glob ".\data\codecap_drift_sine_72.npz" `
+  --mode supervised `
+  --W 4 `
+  --out ".\data\graph_supervised_sine_W4.pt"
+
+Train (GPU)
+mkdir runs -ErrorAction SilentlyContinue
+
+python -m gnn_pipeline.train_selfsupervised `
+  --in_glob ".\data\codecap_drift_sine_72.npz" `
+  --W 4 `
+  --epochs 5 `
+  --batch_size 128 `
+  --out_dir ".\runs\selfsup_gpu"
+
+
+Then:
+
+python -m gnn_pipeline.train_supervised `
+  --in_glob ".\data\codecap_drift_sine_72.npz" `
+  --W 4 `
+  --epochs 3 `
+  --batch_size 64 `
+  --out_dir ".\runs\sup_gpu" `
+  --pretrained ".\runs\selfsup_gpu\model_best.pt"
+
+Evaluate
+
+Baseline:
+
+python -m gnn_pipeline.evaluate `
+  --test_npz ".\data\codecap_drift_sine_72.npz" `
+  --out_dir ".\runs\eval_bp"
+
+
+GNN-assisted:
+
+python -m gnn_pipeline.evaluate `
+  --test_npz ".\data\codecap_drift_sine_72.npz" `
+  --gnn_model ".\runs\sup_gpu\model_best.pt" `
+  --out_dir ".\runs\eval_gnn"
+
+```
 ## Full Pipeline Smoke Test (PowerShell)
 
 Run the following from the **repo root**. This is an **intensive** end-to-end check (data generation → dataset → training → sweeps/ablations).
