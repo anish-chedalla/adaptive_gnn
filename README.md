@@ -59,6 +59,10 @@ python sample_syndromes.py --d 6 --noise biased_circuit --p 0.01 --eta 20 --shot
 
 ## Anish Runs: 
 
+pip install -e .
+python -m tests.test_imports
+
+
 
 ## Full Pipeline Smoke Test (PowerShell)
 
