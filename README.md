@@ -62,7 +62,6 @@ python sample_syndromes.py --d 6 --noise biased_circuit --p 0.01 --eta 20 --shot
  
 1️⃣ Generate Static Code-Capacity Data
 
-For your 72-qubit BB code:
 
 mkdir data -ErrorAction SilentlyContinue
 
@@ -76,6 +75,7 @@ python -m gnn_pipeline.generate_codecap `
   --out .\data\codecap_static_72_p003.npz
 
 2️⃣ Generate Drifting (Sine) Code-Capacity
+
 python -m gnn_pipeline.generate_codecap `
   --code 72_12_6 `
   --p 0.03 `
@@ -88,6 +88,7 @@ python -m gnn_pipeline.generate_codecap `
   --out .\data\codecap_drift_sine_72.npz
 
 3️⃣ Generate OU Drift
+
 python -m gnn_pipeline.generate_codecap `
   --code 72_12_6 `
   --p 0.03 `
@@ -102,6 +103,7 @@ python -m gnn_pipeline.generate_codecap `
   --out .\data\codecap_drift_ou_72.npz
 
 4️⃣ Generate Random Telegraph Noise (RTN)
+
 python -m gnn_pipeline.generate_codecap `
   --code 72_12_6 `
   --p 0.03 `
@@ -115,34 +117,9 @@ python -m gnn_pipeline.generate_codecap `
   --seed 42 `
   --out .\data\codecap_drift_rtn_72.npz
 
-🧠 Why This Happened
-
-Your CLI defines:
-
---code
---drift_model
-
-
-So PowerShell saw --d and tried to match it to:
-
---drift_model
-
---drift_amp
-
---drift_period
-
-That’s why you got:
-
-error: ambiguous option: --d
-
-
-This is good — it means argparse strict parsing is working.
-
-🔬 Now Continue Full GPU Test Flow
-
-Once data exists:
 
 Build Dataset
+
 python -m gnn_pipeline.build_dataset `
   --in_glob ".\data\codecap_drift_sine_72.npz" `
   --mode selfsup `
@@ -159,8 +136,8 @@ python -m gnn_pipeline.build_dataset `
   --out ".\data\graph_supervised_sine_W4.pt"
 
 Train (GPU)
-mkdir runs -ErrorAction SilentlyContinue
 
+mkdir runs -ErrorAction SilentlyContinue
 python -m gnn_pipeline.train_selfsupervised `
   --in_glob ".\data\codecap_drift_sine_72.npz" `
   --W 4 `
@@ -171,6 +148,7 @@ python -m gnn_pipeline.train_selfsupervised `
 
 Then:
 
+
 python -m gnn_pipeline.train_supervised `
   --in_glob ".\data\codecap_drift_sine_72.npz" `
   --W 4 `
@@ -179,14 +157,17 @@ python -m gnn_pipeline.train_supervised `
   --out_dir ".\runs\sup_gpu" `
   --pretrained ".\runs\selfsup_gpu\model_best.pt"
 
+
+
 Evaluate
 
+
 Baseline:
+
 
 python -m gnn_pipeline.evaluate `
   --test_npz ".\data\codecap_drift_sine_72.npz" `
   --out_dir ".\runs\eval_bp"
-
 
 GNN-assisted:
 
