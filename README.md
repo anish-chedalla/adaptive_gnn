@@ -62,6 +62,7 @@ python sample_syndromes.py --d 6 --noise biased_circuit --p 0.01 --eta 20 --shot
 
 
 ```bash
+# INITIALIZATION
 # =========================
 # 0) Enter repo root + sanity
 # =========================
