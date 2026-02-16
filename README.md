@@ -57,9 +57,11 @@ python sample_syndromes.py --d 6 --noise biased_circuit --p 0.01 --eta 20 --shot
 - `--drift_amp`: Drift amplitude (e.g., 0.3 for ±30%)
 - `--drift_period_ticks`: Period of drift in measurement rounds
 
+
 ## Anish Runs: 
 
-```
+
+```bash
 # =========================
 # 0) Enter repo root + sanity
 # =========================
