@@ -78,6 +78,7 @@ Generate code-capacity datasets (static + multiple drift models)
 mkdir data -ErrorAction SilentlyContinue
 
 # Static (no drift)
+
 python -m gnn_pipeline.generate_codecap `
   --code 72_12_6 `
   --p 0.03 `
@@ -88,6 +89,7 @@ python -m gnn_pipeline.generate_codecap `
   --out .\data\codecap_static_72_p003.npz
 
 # Sine drift
+
 python -m gnn_pipeline.generate_codecap `
   --code 72_12_6 `
   --p 0.03 `
@@ -100,6 +102,7 @@ python -m gnn_pipeline.generate_codecap `
   --out .\data\codecap_drift_sine_72.npz
 
 # Ornstein–Uhlenbeck drift
+
 python -m gnn_pipeline.generate_codecap `
   --code 72_12_6 `
   --p 0.03 `
@@ -114,6 +117,7 @@ python -m gnn_pipeline.generate_codecap `
   --out .\data\codecap_drift_ou_72.npz
 
 # Random telegraph noise drift
+
 python -m gnn_pipeline.generate_codecap `
   --code 72_12_6 `
   --p 0.03 `
@@ -128,6 +132,7 @@ python -m gnn_pipeline.generate_codecap `
   --out .\data\codecap_drift_rtn_72.npz
 
 3) Build PyG datasets (selfsup + supervised)
+
 # Self-supervised dataset
 python -m gnn_pipeline.build_dataset `
   --in_glob ".\data\codecap_drift_sine_72.npz" `
@@ -136,6 +141,7 @@ python -m gnn_pipeline.build_dataset `
   --out ".\data\graph_selfsup_sine_W4.pt"
 
 # Supervised dataset
+
 python -m gnn_pipeline.build_dataset `
   --in_glob ".\data\codecap_drift_sine_72.npz" `
   --mode supervised `
@@ -143,9 +149,11 @@ python -m gnn_pipeline.build_dataset `
   --out ".\data\graph_supervised_sine_W4.pt"
 
 # Verify it loads and has splits
+
 python -c "import torch; obj=torch.load(r'.\data\graph_selfsup_sine_W4.pt', weights_only=False); print(obj.keys()); print('train',len(obj['train']),'val',len(obj['val']),'test',len(obj['test']))"
 
 4) Train self-supervised (checkpoint must appear)
+
 mkdir runs -ErrorAction SilentlyContinue
 
 python -m gnn_pipeline.train_selfsupervised `
@@ -159,6 +167,7 @@ dir .\runs\selfsup_sine_W4_gpu
 # Must include: best_model.pt
 
 5) Train supervised (uses BP-in-the-loop) with correct pretrained path
+
 python -m gnn_pipeline.train_supervised `
   --in_glob ".\data\codecap_drift_sine_72.npz" `
   --W 4 `
@@ -169,6 +178,7 @@ python -m gnn_pipeline.train_supervised `
 
 6) Evaluate: BP vs GNN-BP on multiple test sets (static + drift variants)
 # Static test
+
 python -m gnn_pipeline.evaluate `
   --test_npz ".\data\codecap_static_72_p003.npz" `
   --out_dir ".\runs\eval_static_bp"
@@ -179,6 +189,7 @@ python -m gnn_pipeline.evaluate `
   --out_dir ".\runs\eval_static_gnn"
 
 # Sine drift test
+
 python -m gnn_pipeline.evaluate `
   --test_npz ".\data\codecap_drift_sine_72.npz" `
   --out_dir ".\runs\eval_sine_bp"
@@ -189,19 +200,21 @@ python -m gnn_pipeline.evaluate `
   --out_dir ".\runs\eval_sine_gnn"
 
 # OU drift test (generalization)
+
 python -m gnn_pipeline.evaluate `
   --test_npz ".\data\codecap_drift_ou_72.npz" `
   --gnn_model ".\runs\sup_sine_W4_gpu\best_model.pt" `
   --out_dir ".\runs\eval_ou_gnn"
 
 # RTN drift test (generalization)
+
 python -m gnn_pipeline.evaluate `
   --test_npz ".\data\codecap_drift_rtn_72.npz" `
   --gnn_model ".\runs\sup_sine_W4_gpu\best_model.pt" `
   --out_dir ".\runs\eval_rtn_gnn"
 
 
-What “success” looks like (minimum):
+What “success” looks like :
 
 All tests pass.
 
