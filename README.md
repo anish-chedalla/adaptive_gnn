@@ -214,17 +214,23 @@ python -m gnn_pipeline.evaluate `
   --out_dir ".\runs\eval_rtn_gnn"
 
 
-What “success” looks like :
+Sweeps: # Quick sweep sanity (fast)
 
-All tests pass.
+python -m gnn_pipeline.threshold_sweep `
+  --code 72_12_6 `
+  --p_min 0.01 --p_max 0.04 --num_points 3 `
+  --shots 2000 --eta 20 `
+  --out_dir .\runs\sweep_quick
 
-Training produces best_model.pt.
-
-Evaluation produces JSON outputs and does not crash.
-
-GNN-BP doesn’t tank convergence vs BP.
-
-Ideally: GNN-BP improves LER on drift, and doesn’t overfit only to sine.
+# Full static + drift sweep (include GNN + BP-OSD)
+python -m gnn_pipeline.threshold_sweep `
+  --code 72_12_6 `
+  --p_min 0.005 --p_max 0.06 --num_points 8 `
+  --shots 10000 --eta 20 `
+  --drift_models sine,ou,rtn --drift_amp 0.02 --drift_period 500 `
+  --gnn_model .\runs\sup_sine_W4\model_best.pt `
+  --bposd `
+  --out_dir .\runs\sweep_full
 ```
 ## Full Pipeline Smoke Test (PowerShell)
 
