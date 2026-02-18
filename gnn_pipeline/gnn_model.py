@@ -27,10 +27,10 @@ def apply_correction(channel_llr: torch.Tensor, gnn_output, mode: str) -> torch.
     if mode == "additive":
         return channel_llr + gnn_output
     elif mode == "multiplicative":
-        return channel_llr * torch.exp(gnn_output)
+        return channel_llr * torch.exp(gnn_output.clamp(-5.0, 5.0))
     elif mode == "both":
         additive, multiplicative = gnn_output
-        return channel_llr * torch.exp(multiplicative) + additive
+        return channel_llr * torch.exp(multiplicative.clamp(-5.0, 5.0)) + additive
     else:
         raise ValueError(f"Unknown correction mode: {mode}")
 
@@ -135,9 +135,11 @@ class TannerGNN(nn.Module):
         self.use_residual = use_residual
         self.use_layer_norm = use_layer_norm
 
-        # Input projection
+        # Input projection with normalization for mixed-scale features
+        # (LLR values ~20, indicator bits ~1)
         self.input_proj = nn.Sequential(
             nn.Linear(node_feat_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
         )

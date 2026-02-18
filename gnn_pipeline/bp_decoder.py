@@ -83,6 +83,10 @@ class MinSumBPDecoder(nn.Module):
         self.register_buffer("var_adj", torch.from_numpy(var_adj_arr))
         self.register_buffer("var_adj_mask", torch.from_numpy(var_adj_mask))
 
+        # Sparse PCM for fast syndrome check (replaces Python edge loop)
+        pcm_sparse = torch.from_numpy(pcm.astype(np.float32))
+        self.register_buffer("pcm_dense", pcm_sparse)  # (m, n)
+
     def forward(
         self,
         syndrome: torch.Tensor,
@@ -111,7 +115,7 @@ class MinSumBPDecoder(nn.Module):
         # Initialize messages: check-to-var (CTV) = 0
         ctv = torch.zeros(B, self.num_edges, device=device)
 
-        for _ in range(iters):
+        for it in range(iters):
             # --- Variable-to-check (VTC) ---
             # mu_{v->c} = channel_llr[v] + sum_{c' != c} ctv[c'->v]
             # Compute total incoming CTV per variable
@@ -165,6 +169,17 @@ class MinSumBPDecoder(nn.Module):
                          check_adj_expanded.reshape(B, -1),
                          ctv_new.reshape(B, -1))
 
+            # Early termination: check if all samples converged (non-differentiable path)
+            if not self.training and it < iters - 1:
+                with torch.no_grad():
+                    ctv_g = ctv[:, self.var_adj]
+                    ctv_m = ctv_g * self.var_adj_mask.unsqueeze(0)
+                    vt = ctv_m.sum(dim=2)
+                    hd = ((channel_llr + vt) < 0).float()  # LLR < 0 means error likely
+                    syn_hat = (hd @ self.pcm_dense.t()) % 2
+                    if (syn_hat - syndrome).abs().sum(dim=1).max() < 0.5:
+                        break  # All converged, skip remaining iterations
+
         # Final marginals
         ctv_gathered = ctv[:, self.var_adj]
         ctv_masked = ctv_gathered * self.var_adj_mask.unsqueeze(0)
@@ -174,15 +189,9 @@ class MinSumBPDecoder(nn.Module):
         marginals = torch.sigmoid(-total_llr)  # P(error) = sigma(-LLR)
         hard_decision = (marginals > 0.5).long()
 
-        # Check convergence: does hard_decision satisfy syndrome?
-        # syndrome_hat[c] = XOR of hard_decision[v] for v in support(check c)
+        # Check convergence via vectorized matmul (replaces Python edge loop)
         hd_float = hard_decision.float()
-        syndrome_hat = torch.zeros(B, self.num_checks, device=device)
-        for e in range(self.num_edges):
-            c = self.check_idx[e]
-            v = self.var_idx[e]
-            syndrome_hat[:, c] = syndrome_hat[:, c] + hd_float[:, v]
-        syndrome_hat = syndrome_hat % 2
+        syndrome_hat = (hd_float @ self.pcm_dense.t()) % 2  # (B, m)
         converged = (syndrome_hat - syndrome).abs().sum(dim=1) < 0.5  # (B,)
 
         return marginals, hard_decision, converged

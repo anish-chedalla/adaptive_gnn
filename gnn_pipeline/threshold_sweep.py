@@ -34,8 +34,6 @@ from codes.codes_q import create_bivariate_bicycle_codes
 from codes.code_registry import get_code_params, list_codes
 from gnn_pipeline.evaluate import (
     _check_logical_error,
-    run_css_bp_decoder,
-    run_gnn_css_bp_decoder,
     wilson_score_interval_binom,
 )
 from gnn_pipeline.generate_codecap import generate_code_capacity_data
@@ -58,12 +56,18 @@ def _decode_all_shots(
 ) -> dict:
     """Decode all shots and return results for each decoder.
 
+    Uses batched BP decoding for CPU/GPU parallelism and multiprocessing
+    for BP-OSD/MWPM.
+
     Returns:
         Dictionary with keys like 'bp', 'gnn_bp', 'bposd', each containing
         'errors', 'convergences', 'shots'.
     """
     from gnn_pipeline.bp_decoder import MinSumBPDecoder
     from gnn_pipeline.tanner_graph import build_tanner_graph
+    from gnn_pipeline.evaluate import _check_logical_errors_batch
+    from gnn_pipeline.gnn_model import apply_correction
+    from torch_geometric.data import Data
 
     mx, n = hx.shape
     mz = hz.shape[0]
@@ -77,88 +81,187 @@ def _decode_all_shots(
     llr_z = float(math.log((1.0 - pz_c) / pz_c))
     llr_x = float(math.log((1.0 - px_c) / px_c))
 
+    # Split syndromes into X and Z parts (vectorized)
+    all_x_syn = syndromes[:, :mx].astype(np.float32)
+    all_z_syn = syndromes[:, mx:mx+mz].astype(np.float32)
+
     # Pre-build BP decoders (reused across all shots -- major speedup)
     dec_z_pre = MinSumBPDecoder(hx, max_iter=100, alpha=0.8, clamp_llr=20.0).to(device)
     dec_x_pre = MinSumBPDecoder(hz, max_iter=100, alpha=0.8, clamp_llr=20.0).to(device)
 
-    # Pre-build Tanner graph for GNN (reused across all shots)
-    tanner_cache = None
+    # ---------- Batched BP ----------
+    CHUNK = 512
+    bp_hard_z_all = []
+    bp_hard_x_all = []
+    bp_conv_all = []
+
+    for start in range(0, shots, CHUNK):
+        end = min(start + CHUNK, shots)
+        B_chunk = end - start
+        x_syn_t = torch.from_numpy(all_x_syn[start:end]).float().to(device)
+        z_syn_t = torch.from_numpy(all_z_syn[start:end]).float().to(device)
+        llr_z_t = torch.full((B_chunk, n), llr_z, dtype=torch.float32, device=device)
+        llr_x_t = torch.full((B_chunk, n), llr_x, dtype=torch.float32, device=device)
+
+        with torch.no_grad():
+            _, hard_z, conv_z = dec_z_pre(x_syn_t, llr_z_t)
+            _, hard_x, conv_x = dec_x_pre(z_syn_t, llr_x_t)
+
+        bp_hard_z_all.append(hard_z.cpu().numpy())
+        bp_hard_x_all.append(hard_x.cpu().numpy())
+        bp_conv_all.append((conv_z & conv_x).cpu().numpy())
+
+    bp_z_errors = np.concatenate(bp_hard_z_all, axis=0)
+    bp_x_errors = np.concatenate(bp_hard_x_all, axis=0)
+    bp_conv = np.concatenate(bp_conv_all, axis=0)
+
+    bp_logical = _check_logical_errors_batch(
+        bp_z_errors, bp_x_errors, lx, lz, observables.astype(np.float32),
+    )
+    bp_errors = int(bp_logical.sum())
+    bp_converged = int(bp_conv.sum())
+
+    # ---------- Batched GNN-BP ----------
+    gnn_errors = 0
+    gnn_converged = 0
     if gnn_model is not None:
         node_type_np, edge_index_np, edge_type_np = build_tanner_graph(hx, hz)
-        tanner_cache = (
-            torch.from_numpy(node_type_np).long().to(device),
-            torch.from_numpy(edge_index_np).long().to(device),
-            torch.from_numpy(edge_type_np).long().to(device),
-        )
+        node_type_t = torch.from_numpy(node_type_np).long().to(device)
+        edge_index_t = torch.from_numpy(edge_index_np).long().to(device)
+        edge_type_t = torch.from_numpy(edge_type_np).long().to(device)
+        num_nodes = n + mx + mz
 
-    # Optionally load BP-OSD
-    bposd_fn = None
+        gnn_hard_z_all = []
+        gnn_hard_x_all = []
+        gnn_conv_all = []
+
+        for start in range(0, shots, CHUNK):
+            end = min(start + CHUNK, shots)
+            B_chunk = end - start
+
+            corrections_z = np.zeros((B_chunk, n), dtype=np.float32)
+            corrections_x = np.zeros((B_chunk, n), dtype=np.float32)
+
+            for i in range(B_chunk):
+                si = start + i
+                x_feat = torch.zeros(num_nodes, 4, dtype=torch.float32)
+                avg_llr = (llr_z + llr_x) / 2.0
+                x_feat[:n, 0] = avg_llr
+                x_feat[:n, 1] = 1.0
+                x_feat[n:n+mx, 0] = torch.from_numpy(all_x_syn[si]).float()
+                x_feat[n:n+mx, 2] = 1.0
+                x_feat[n+mx:, 0] = torch.from_numpy(all_z_syn[si]).float()
+                x_feat[n+mx:, 3] = 1.0
+
+                data_obj = Data(
+                    x=x_feat.to(device),
+                    edge_index=edge_index_t,
+                    edge_type=edge_type_t,
+                    node_type=node_type_t,
+                    channel_llr=torch.full((n,), avg_llr, dtype=torch.float32, device=device),
+                )
+
+                with torch.no_grad():
+                    gnn_model.eval()
+                    gnn_out = gnn_model(data_obj)
+
+                llr_z_s = torch.full((n,), llr_z, dtype=torch.float32, device=device)
+                llr_x_s = torch.full((n,), llr_x, dtype=torch.float32, device=device)
+
+                correction_mode = getattr(gnn_model, "correction_mode", "additive")
+                if correction_mode == "both":
+                    add_c, mul_c = gnn_out
+                    add_c = torch.clamp(add_c, -20.0, 20.0)
+                    mul_c = torch.clamp(mul_c, -5.0, 5.0)
+                    gnn_out = (add_c, mul_c)
+                else:
+                    gnn_out = torch.clamp(gnn_out, -20.0, 20.0)
+
+                corrections_z[i] = apply_correction(llr_z_s, gnn_out, correction_mode).cpu().numpy()
+                corrections_x[i] = apply_correction(llr_x_s, gnn_out, correction_mode).cpu().numpy()
+
+            x_syn_t = torch.from_numpy(all_x_syn[start:end]).float().to(device)
+            z_syn_t = torch.from_numpy(all_z_syn[start:end]).float().to(device)
+            corr_z_t = torch.from_numpy(corrections_z).float().to(device)
+            corr_x_t = torch.from_numpy(corrections_x).float().to(device)
+
+            with torch.no_grad():
+                _, hard_z, conv_z = dec_z_pre(x_syn_t, corr_z_t)
+                _, hard_x, conv_x = dec_x_pre(z_syn_t, corr_x_t)
+
+            gnn_hard_z_all.append(hard_z.cpu().numpy())
+            gnn_hard_x_all.append(hard_x.cpu().numpy())
+            gnn_conv_all.append((conv_z & conv_x).cpu().numpy())
+
+        gnn_z_errors = np.concatenate(gnn_hard_z_all, axis=0)
+        gnn_x_errors = np.concatenate(gnn_hard_x_all, axis=0)
+        gnn_conv = np.concatenate(gnn_conv_all, axis=0)
+
+        gnn_logical = _check_logical_errors_batch(
+            gnn_z_errors, gnn_x_errors, lx, lz, observables.astype(np.float32),
+        )
+        gnn_errors = int(gnn_logical.sum())
+        gnn_converged = int(gnn_conv.sum())
+
+    # ---------- BP-OSD (parallel with threads) ----------
+    # ThreadPoolExecutor: BP-OSD/MWPM are C-extension-backed and release
+    # the GIL, so threads give true parallelism. Avoids Windows pickle
+    # issues with ProcessPoolExecutor.
+    bposd_errors = 0
+    bposd_available = False
     if use_bposd:
         try:
             from gnn_pipeline.bposd_decoder import run_css_bposd_decoder
-            bposd_fn = run_css_bposd_decoder
+            bposd_available = True
         except ImportError:
             pass
 
-    # Optionally load MWPM
-    mwpm_matchers = None
-    mwpm_emaps = None
+    if bposd_available:
+        import concurrent.futures
+        import os
+
+        n_workers = max(1, os.cpu_count() - 1)
+
+        def _bposd_shot(idx):
+            z_e, x_e = run_css_bposd_decoder(
+                all_x_syn[idx], all_z_syn[idx], hx, hz,
+                error_rate_z=pz, error_rate_x=px,
+            )
+            return _check_logical_error(z_e, x_e, lx, lz, observables[idx])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results_bposd = list(pool.map(_bposd_shot, range(shots)))
+        bposd_errors = sum(results_bposd)
+
+    # ---------- MWPM (parallel with threads) ----------
+    mwpm_errors = 0
+    mwpm_available = False
     if use_mwpm:
         try:
             from gnn_pipeline.matching_decoder import build_mwpm_css, run_mwpm_css
             m_z, m_x, emap_z, emap_x = build_mwpm_css(hx, hz, pz, px)
-            mwpm_matchers = (m_z, m_x)
-            mwpm_emaps = (emap_z, emap_x)
+            mwpm_available = True
         except ImportError:
             pass
 
-    bp_errors = 0
-    bp_converged = 0
-    gnn_errors = 0
-    gnn_converged = 0
-    bposd_errors = 0
-    mwpm_errors = 0
+    if mwpm_available:
+        import concurrent.futures
+        import os
 
-    for i in range(shots):
-        syndrome = syndromes[i]
-        observable = observables[i]
-        x_syn = syndrome[:mx].astype(np.float32)
-        z_syn = syndrome[mx:mx+mz].astype(np.float32)
+        n_workers = max(1, os.cpu_count() - 1)
 
-        # BP
-        z_err, x_err, zc, xc = run_css_bp_decoder(
-            x_syn, z_syn, hx, hz, llr_z, llr_x, n, device,
-            dec_z_prebuilt=dec_z_pre, dec_x_prebuilt=dec_x_pre,
-        )
-        bp_converged += int(zc and xc)
-        bp_errors += int(_check_logical_error(z_err, x_err, lx, lz, observable))
-
-        # GNN-BP
-        if gnn_model is not None:
-            z_err_g, x_err_g, zc_g, xc_g = run_gnn_css_bp_decoder(
-                x_syn, z_syn, hx, hz, llr_z, llr_x, n, gnn_model, device,
-                dec_z_prebuilt=dec_z_pre, dec_x_prebuilt=dec_x_pre,
-                tanner_graph=tanner_cache,
+        def _mwpm_shot(idx):
+            z_e, x_e = run_mwpm_css(
+                all_x_syn[idx], all_z_syn[idx], m_z, m_x, n,
+                edge_map_z=emap_z, edge_map_x=emap_x,
             )
-            gnn_converged += int(zc_g and xc_g)
-            gnn_errors += int(_check_logical_error(z_err_g, x_err_g, lx, lz, observable))
+            return _check_logical_error(z_e, x_e, lx, lz, observables[idx])
 
-        # BP-OSD
-        if bposd_fn is not None:
-            z_err_o, x_err_o = bposd_fn(
-                x_syn, z_syn, hx, hz,
-                error_rate_z=pz, error_rate_x=px,
-            )
-            bposd_errors += int(_check_logical_error(z_err_o, x_err_o, lx, lz, observable))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results_mwpm = list(pool.map(_mwpm_shot, range(shots)))
+        mwpm_errors = sum(results_mwpm)
 
-        # MWPM
-        if mwpm_matchers is not None:
-            z_err_m, x_err_m = run_mwpm_css(
-                x_syn, z_syn, mwpm_matchers[0], mwpm_matchers[1], n,
-                edge_map_z=mwpm_emaps[0], edge_map_x=mwpm_emaps[1],
-            )
-            mwpm_errors += int(_check_logical_error(z_err_m, x_err_m, lx, lz, observable))
-
+    # ---------- Build result dict ----------
     result = {
         "bp": {
             "errors": bp_errors,
@@ -172,12 +275,12 @@ def _decode_all_shots(
             "converged": gnn_converged,
             "shots": shots,
         }
-    if bposd_fn is not None:
+    if bposd_available:
         result["bposd"] = {
             "errors": bposd_errors,
             "shots": shots,
         }
-    if mwpm_matchers is not None:
+    if mwpm_available:
         result["mwpm"] = {
             "errors": mwpm_errors,
             "shots": shots,

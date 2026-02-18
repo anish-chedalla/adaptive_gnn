@@ -135,20 +135,24 @@ def build_graph_dataset(
         # Reshape syndromes into (shots, num_det_rounds, total_checks)
         syn_3d = syndromes.reshape(shots, num_det_rounds, total_checks)
 
+        # Pre-compute vectorized per-shot LLRs (avoids Python math.log in inner loop)
+        if mode == "supervised" and p_values_all is not None:
+            p_all = np.clip(p_values_all, 1e-7, 1.0 - 1e-7)
+            pz_all = np.clip(p_all * eta / (eta + 1), 1e-7, 1.0 - 1e-7)
+            px_all = np.clip(p_all / (eta + 1), 1e-7, 1.0 - 1e-7)
+            llr_z_vals = np.log((1.0 - pz_all) / pz_all).astype(np.float32)  # (shots,)
+            llr_x_vals = np.log((1.0 - px_all) / px_all).astype(np.float32)  # (shots,)
+            llr_vals = np.log((1.0 - p_all) / p_all).astype(np.float32)      # (shots,)
+            _precomputed_drift = True
+        else:
+            _precomputed_drift = False
+
         for shot_idx in range(shots):
-            # Compute per-shot LLRs if p_values available (drift-aware)
-            if mode == "supervised" and p_values_all is not None:
-                p_shot = float(p_values_all[shot_idx])
-                p_shot = max(min(p_shot, 1.0 - 1e-7), 1e-7)
-                pz_shot = p_shot * eta / (eta + 1)
-                px_shot = p_shot / (eta + 1)
-                pz_shot = max(min(pz_shot, 1.0 - 1e-7), 1e-7)
-                px_shot = max(min(px_shot, 1.0 - 1e-7), 1e-7)
-                shot_llr_z = torch.full((n,), float(math.log((1.0 - pz_shot) / pz_shot)), dtype=torch.float32)
-                shot_llr_x = torch.full((n,), float(math.log((1.0 - px_shot) / px_shot)), dtype=torch.float32)
-                # Also update generic channel LLR for node features
-                shot_llr_val = float(math.log((1.0 - p_shot) / p_shot))
-                shot_channel_llr = torch.full((n,), shot_llr_val, dtype=torch.float32)
+            # Use pre-computed vectorized LLRs (drift-aware)
+            if _precomputed_drift:
+                shot_llr_z = torch.full((n,), llr_z_vals[shot_idx], dtype=torch.float32)
+                shot_llr_x = torch.full((n,), llr_x_vals[shot_idx], dtype=torch.float32)
+                shot_channel_llr = torch.full((n,), llr_vals[shot_idx], dtype=torch.float32)
             else:
                 shot_llr_z = channel_llr_z_base
                 shot_llr_x = channel_llr_x_base

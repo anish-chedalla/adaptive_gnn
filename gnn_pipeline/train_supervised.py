@@ -34,14 +34,66 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import Adam
+from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch_geometric.loader import DataLoader
 
 from gnn_pipeline.bp_decoder import MinSumBPDecoder
 from gnn_pipeline.dataset import build_graph_dataset, _load_npz
 from gnn_pipeline.gnn_model import TannerGNN, apply_correction
-from gnn_pipeline.loss_functions import weighted_bce_loss, focal_loss, logical_aware_loss
+from gnn_pipeline.loss_functions import weighted_bce_loss, focal_loss, logical_aware_loss, syndrome_consistency_loss
+
+
+def _compute_loss(
+    marginals_z: torch.Tensor,
+    marginals_x: torch.Tensor,
+    z_error: torch.Tensor,
+    x_error: torch.Tensor,
+    loss_fn: str,
+    pos_weight: float = 50.0,
+    focal_alpha: float = 0.25,
+    focal_gamma: float = 2.0,
+    logical_weight: float = 0.1,
+    lx_t: torch.Tensor | None = None,
+    lz_t: torch.Tensor | None = None,
+    syn_weight: float = 0.0,
+    x_syndrome: torch.Tensor | None = None,
+    z_syndrome: torch.Tensor | None = None,
+    hx_t: torch.Tensor | None = None,
+    hz_t: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute loss on BP marginals vs ground-truth errors (shared by train/eval)."""
+    if loss_fn == "mse":
+        base = F.mse_loss(marginals_z, z_error) + F.mse_loss(marginals_x, x_error)
+    elif loss_fn == "bce":
+        base = F.binary_cross_entropy(marginals_z, z_error) + \
+               F.binary_cross_entropy(marginals_x, x_error)
+    elif loss_fn == "weighted_bce":
+        base = weighted_bce_loss(marginals_z, z_error, pos_weight=pos_weight) + \
+               weighted_bce_loss(marginals_x, x_error, pos_weight=pos_weight)
+    elif loss_fn == "focal":
+        base = focal_loss(marginals_z, z_error, alpha=focal_alpha, gamma=focal_gamma) + \
+               focal_loss(marginals_x, x_error, alpha=focal_alpha, gamma=focal_gamma)
+    elif loss_fn == "logical_mse":
+        base = logical_aware_loss(
+            marginals_z, marginals_x, z_error, x_error,
+            lx_t, lz_t, base_loss_fn=F.mse_loss, logical_weight=logical_weight,
+        )
+    elif loss_fn == "logical_bce":
+        base = logical_aware_loss(
+            marginals_z, marginals_x, z_error, x_error,
+            lx_t, lz_t, base_loss_fn=F.binary_cross_entropy, logical_weight=logical_weight,
+        )
+    else:
+        raise ValueError(f"Unknown loss function: {loss_fn}")
+
+    # Syndrome consistency auxiliary loss
+    if syn_weight > 0 and hx_t is not None and hz_t is not None:
+        syn_loss = syndrome_consistency_loss(marginals_z, x_syndrome, hx_t) + \
+                   syndrome_consistency_loss(marginals_x, z_syndrome, hz_t)
+        base = base + syn_weight * syn_loss
+
+    return base
 
 
 def train_epoch(
@@ -64,6 +116,11 @@ def train_epoch(
     lz_t: torch.Tensor | None = None,
     accumulate_grad: int = 1,
     correction_mode: str = "additive",
+    scaler: torch.amp.GradScaler | None = None,
+    use_amp: bool = False,
+    syn_weight: float = 0.0,
+    hx_t: torch.Tensor | None = None,
+    hz_t: torch.Tensor | None = None,
 ) -> dict:
     """Train for one epoch on supervised loss through differentiable BP.
 
@@ -80,73 +137,71 @@ def train_epoch(
     n_checks = mx + mz
     optimizer.zero_grad()
 
+    amp_dtype = torch.float16 if use_amp else None
+
     for batch in loader:
         batch = batch.to(device)
         B = batch.num_graphs
 
-        # GNN forward: get per-qubit LLR corrections
-        gnn_out = model(batch)
-        if correction_mode == "both":
-            add_corr, mul_corr = gnn_out
-            add_corr = torch.clamp(add_corr, -20.0, 20.0).view(B, n_qubits)
-            mul_corr = torch.clamp(mul_corr, -5.0, 5.0).view(B, n_qubits)
-            gnn_out = (add_corr, mul_corr)
-        else:
-            gnn_out = torch.clamp(gnn_out, -20.0, 20.0).view(B, n_qubits)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            # GNN forward: get per-qubit LLR corrections
+            gnn_out = model(batch)
+            if correction_mode == "both":
+                add_corr, mul_corr = gnn_out
+                add_corr = torch.clamp(add_corr, -20.0, 20.0).view(B, n_qubits)
+                mul_corr = torch.clamp(mul_corr, -5.0, 5.0).view(B, n_qubits)
+                gnn_out = (add_corr, mul_corr)
+            else:
+                gnn_out = torch.clamp(gnn_out, -20.0, 20.0).view(B, n_qubits)
 
-        # Reshape supervised data
-        channel_llr_z = batch.channel_llr_z.view(B, n_qubits)
-        channel_llr_x = batch.channel_llr_x.view(B, n_qubits)
-        z_error = batch.z_error.view(B, n_qubits)
-        x_error = batch.x_error.view(B, n_qubits)
-        target_syn = batch.target_syndrome.view(B, n_checks)
+            # Reshape supervised data
+            channel_llr_z = batch.channel_llr_z.view(B, n_qubits)
+            channel_llr_x = batch.channel_llr_x.view(B, n_qubits)
+            z_error = batch.z_error.view(B, n_qubits)
+            x_error = batch.x_error.view(B, n_qubits)
+            target_syn = batch.target_syndrome.view(B, n_checks)
 
-        # Apply GNN corrections to per-Pauli channel LLRs
-        corrected_llr_z = apply_correction(channel_llr_z, gnn_out, correction_mode)
-        corrected_llr_x = apply_correction(channel_llr_x, gnn_out, correction_mode)
+            # Apply GNN corrections to per-Pauli channel LLRs
+            corrected_llr_z = apply_correction(channel_llr_z, gnn_out, correction_mode)
+            corrected_llr_x = apply_correction(channel_llr_x, gnn_out, correction_mode)
 
-        # Extract CSS syndromes
-        x_syndrome = target_syn[:, :mx]   # X-checks detect Z-errors
-        z_syndrome = target_syn[:, mx:]   # Z-checks detect X-errors
+            # Extract CSS syndromes
+            x_syndrome = target_syn[:, :mx]   # X-checks detect Z-errors
+            z_syndrome = target_syn[:, mx:]   # Z-checks detect X-errors
 
-        # Differentiable BP forward
-        marginals_z, hard_z, conv_z = dec_z(x_syndrome, corrected_llr_z)
-        marginals_x, hard_x, conv_x = dec_x(z_syndrome, corrected_llr_x)
+            # Differentiable BP forward
+            marginals_z, hard_z, conv_z = dec_z(x_syndrome, corrected_llr_z)
+            marginals_x, hard_x, conv_x = dec_x(z_syndrome, corrected_llr_x)
 
-        # Loss on soft marginals vs ground-truth error vectors
-        if loss_fn == "mse":
-            loss = F.mse_loss(marginals_z, z_error) + F.mse_loss(marginals_x, x_error)
-        elif loss_fn == "bce":
-            loss = F.binary_cross_entropy(marginals_z, z_error) + \
-                   F.binary_cross_entropy(marginals_x, x_error)
-        elif loss_fn == "weighted_bce":
-            loss = weighted_bce_loss(marginals_z, z_error, pos_weight=pos_weight) + \
-                   weighted_bce_loss(marginals_x, x_error, pos_weight=pos_weight)
-        elif loss_fn == "focal":
-            loss = focal_loss(marginals_z, z_error, alpha=focal_alpha, gamma=focal_gamma) + \
-                   focal_loss(marginals_x, x_error, alpha=focal_alpha, gamma=focal_gamma)
-        elif loss_fn == "logical_mse":
-            loss = logical_aware_loss(
+            # Loss on soft marginals vs ground-truth error vectors
+            loss = _compute_loss(
                 marginals_z, marginals_x, z_error, x_error,
-                lx_t, lz_t, base_loss_fn=F.mse_loss, logical_weight=logical_weight,
+                loss_fn, pos_weight, focal_alpha, focal_gamma,
+                logical_weight, lx_t, lz_t,
+                syn_weight=syn_weight,
+                x_syndrome=x_syndrome, z_syndrome=z_syndrome,
+                hx_t=hx_t, hz_t=hz_t,
             )
-        elif loss_fn == "logical_bce":
-            loss = logical_aware_loss(
-                marginals_z, marginals_x, z_error, x_error,
-                lx_t, lz_t, base_loss_fn=F.binary_cross_entropy, logical_weight=logical_weight,
-            )
-        else:
-            raise ValueError(f"Unknown loss function: {loss_fn}")
 
-        # Gradient accumulation
+        # Gradient accumulation with AMP support
         raw_loss = loss.item()
         scaled_loss = loss / accumulate_grad
-        scaled_loss.backward()
+        if scaler is not None:
+            scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
 
         if (num_batches + 1) % accumulate_grad == 0:
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-            optimizer.step()
+            if scaler is not None:
+                if grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                optimizer.step()
             optimizer.zero_grad()
 
         # Metrics
@@ -165,9 +220,16 @@ def train_epoch(
 
     # Flush remaining accumulated gradients
     if num_batches % accumulate_grad != 0:
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        optimizer.step()
+        if scaler is not None:
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            optimizer.step()
         optimizer.zero_grad()
 
     n = max(num_batches, 1)
@@ -198,6 +260,9 @@ def eval_epoch(
     lx_t: torch.Tensor | None = None,
     lz_t: torch.Tensor | None = None,
     correction_mode: str = "additive",
+    syn_weight: float = 0.0,
+    hx_t: torch.Tensor | None = None,
+    hz_t: torch.Tensor | None = None,
 ) -> dict:
     """Evaluate on validation/test set."""
     model.eval()
@@ -237,29 +302,14 @@ def eval_epoch(
         marginals_z, hard_z, conv_z = dec_z(x_syndrome, corrected_llr_z)
         marginals_x, hard_x, conv_x = dec_x(z_syndrome, corrected_llr_x)
 
-        if loss_fn == "mse":
-            loss = F.mse_loss(marginals_z, z_error) + F.mse_loss(marginals_x, x_error)
-        elif loss_fn == "bce":
-            loss = F.binary_cross_entropy(marginals_z, z_error) + \
-                   F.binary_cross_entropy(marginals_x, x_error)
-        elif loss_fn == "weighted_bce":
-            loss = weighted_bce_loss(marginals_z, z_error, pos_weight=pos_weight) + \
-                   weighted_bce_loss(marginals_x, x_error, pos_weight=pos_weight)
-        elif loss_fn == "focal":
-            loss = focal_loss(marginals_z, z_error, alpha=focal_alpha, gamma=focal_gamma) + \
-                   focal_loss(marginals_x, x_error, alpha=focal_alpha, gamma=focal_gamma)
-        elif loss_fn == "logical_mse":
-            loss = logical_aware_loss(
-                marginals_z, marginals_x, z_error, x_error,
-                lx_t, lz_t, base_loss_fn=F.mse_loss, logical_weight=logical_weight,
-            )
-        elif loss_fn == "logical_bce":
-            loss = logical_aware_loss(
-                marginals_z, marginals_x, z_error, x_error,
-                lx_t, lz_t, base_loss_fn=F.binary_cross_entropy, logical_weight=logical_weight,
-            )
-        else:
-            raise ValueError(f"Unknown loss function: {loss_fn}")
+        loss = _compute_loss(
+            marginals_z, marginals_x, z_error, x_error,
+            loss_fn, pos_weight, focal_alpha, focal_gamma,
+            logical_weight, lx_t, lz_t,
+            syn_weight=syn_weight,
+            x_syndrome=x_syndrome, z_syndrome=z_syndrome,
+            hx_t=hx_t, hz_t=hz_t,
+        )
 
         bit_acc_z = (hard_z == z_error.long()).float().mean().item()
         bit_acc_x = (hard_x == x_error.long()).float().mean().item()
@@ -306,14 +356,16 @@ def main(argv: List[str] | None = None) -> int:
         choices=["mse", "bce", "weighted_bce", "focal", "logical_mse", "logical_bce"],
         help="Loss function on BP marginals",
     )
-    parser.add_argument("--pos_weight", type=float, default=50.0,
-                        help="Positive class weight for weighted_bce (default: 50)")
+    parser.add_argument("--pos_weight", type=float, default=0.0,
+                        help="Positive class weight for weighted_bce (0=auto from data, else fixed value)")
     parser.add_argument("--focal_alpha", type=float, default=0.25,
                         help="Focal loss alpha (default: 0.25)")
     parser.add_argument("--focal_gamma", type=float, default=2.0,
                         help="Focal loss gamma (default: 2.0)")
     parser.add_argument("--logical_weight", type=float, default=0.1,
                         help="Weight for logical-flip penalty (default: 0.1)")
+    parser.add_argument("--syn_weight", type=float, default=0.1,
+                        help="Weight for syndrome-consistency auxiliary loss (default: 0.1, 0 to disable)")
     parser.add_argument(
         "--grad_clip", type=float, default=1.0,
         help="Gradient clipping max norm (0 to disable)",
@@ -337,6 +389,10 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument(
         "--amp", action="store_true",
         help="Enable automatic mixed-precision training (GPU only)",
+    )
+    parser.add_argument(
+        "--weight_decay", type=float, default=1e-4,
+        help="AdamW weight decay (default: 1e-4, 0 to disable)",
     )
     parser.add_argument(
         "--pretrained", type=str, default=None,
@@ -399,6 +455,8 @@ def main(argv: List[str] | None = None) -> int:
         print("ERROR: No training data", file=sys.stderr)
         return 1
 
+    mode_is_weighted = args.loss in ("weighted_bce",)
+
     # Extract PCM matrices and logical operators
     first_npz = _load_npz(npz_paths[0])
     hx = first_npz["hx"].astype(np.float32)
@@ -418,6 +476,29 @@ def main(argv: List[str] | None = None) -> int:
             print("ERROR: logical_* loss requires lx/lz in NPZ", file=sys.stderr)
             return 1
 
+    # Auto-compute pos_weight from data if not specified
+    if args.pos_weight <= 0 and mode_is_weighted:
+        z_err = first_npz.get("z_errors", None)
+        x_err = first_npz.get("x_errors", None)
+        if z_err is not None and x_err is not None:
+            all_errors = np.concatenate([z_err.ravel(), x_err.ravel()])
+            n_pos = all_errors.sum()
+            n_neg = all_errors.size - n_pos
+            args.pos_weight = max(1.0, n_neg / max(n_pos, 1.0))
+            print(f"Auto pos_weight from data: {args.pos_weight:.1f} (error rate: {n_pos/all_errors.size:.4f})")
+        else:
+            args.pos_weight = 50.0
+            print(f"Using default pos_weight: {args.pos_weight}")
+    elif args.pos_weight <= 0:
+        args.pos_weight = 50.0  # fallback
+
+    # PCM tensors for syndrome consistency loss
+    hx_t, hz_t = None, None
+    if args.syn_weight > 0:
+        hx_t = torch.from_numpy(hx.astype(np.float32))
+        hz_t = torch.from_numpy(hz.astype(np.float32))
+        print(f"Syndrome consistency loss enabled (weight={args.syn_weight})")
+
     # Create dataloaders
     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False)
@@ -426,11 +507,15 @@ def main(argv: List[str] | None = None) -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Move logical operators to device if needed
+    # Move logical operators and PCMs to device if needed
     if lx_t is not None:
         lx_t = lx_t.to(device)
     if lz_t is not None:
         lz_t = lz_t.to(device)
+    if hx_t is not None:
+        hx_t = hx_t.to(device)
+    if hz_t is not None:
+        hz_t = hz_t.to(device)
 
     # Build BP decoders ONCE (expensive constructors)
     print(f"Building BP decoders (bp_iters={args.bp_iters})...")
@@ -471,7 +556,10 @@ def main(argv: List[str] | None = None) -> int:
     print(f"Model: {n_params:,} trainable parameters")
 
     # Optimizer and scheduler
-    optimizer = Adam(model.parameters(), lr=args.lr)
+    if args.weight_decay > 0:
+        optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        optimizer = Adam(model.parameters(), lr=args.lr)
     scheduler = None
     if args.scheduler == "cosine":
         if args.warmup_epochs > 0:
@@ -539,6 +627,8 @@ def main(argv: List[str] | None = None) -> int:
             lx_t=lx_t, lz_t=lz_t,
             accumulate_grad=args.accumulate_grad,
             correction_mode=args.correction_mode,
+            scaler=scaler, use_amp=use_amp,
+            syn_weight=args.syn_weight, hx_t=hx_t, hz_t=hz_t,
         )
         val_metrics = eval_epoch(
             model, val_loader, device,
@@ -550,6 +640,7 @@ def main(argv: List[str] | None = None) -> int:
             logical_weight=args.logical_weight,
             lx_t=lx_t, lz_t=lz_t,
             correction_mode=args.correction_mode,
+            syn_weight=args.syn_weight, hx_t=hx_t, hz_t=hz_t,
         )
 
         if scheduler is not None:
@@ -584,9 +675,10 @@ def main(argv: List[str] | None = None) -> int:
             # Raw state dict (backward-compatible with evaluate.py)
             torch.save(model.state_dict(), str(out_dir / "best_model.pt"))
 
-            # Rich checkpoint with architecture info
-            torch.save({
+            # Rich checkpoint with architecture info + optimizer state
+            ckpt = {
                 "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
                 "hidden_dim": args.hidden_dim,
                 "num_mp_layers": args.num_mp_layers,
                 "node_feat_dim": 4, "edge_types": 2, "dropout": 0.1,
@@ -595,7 +687,12 @@ def main(argv: List[str] | None = None) -> int:
                 "loss_fn": args.loss,
                 "epoch": epoch + 1,
                 "val_loss": best_val_loss,
-            }, str(out_dir / "best_checkpoint.pt"))
+            }
+            if scheduler is not None:
+                ckpt["scheduler_state_dict"] = scheduler.state_dict()
+            if scaler is not None:
+                ckpt["scaler_state_dict"] = scaler.state_dict()
+            torch.save(ckpt, str(out_dir / "best_checkpoint.pt"))
 
             print(f"  -> New best val loss: {best_val_loss:.6f}")
         else:
@@ -642,6 +739,7 @@ def main(argv: List[str] | None = None) -> int:
             logical_weight=args.logical_weight,
             lx_t=lx_t, lz_t=lz_t,
             correction_mode=args.correction_mode,
+            syn_weight=args.syn_weight, hx_t=hx_t, hz_t=hz_t,
         )
         print(
             f"Test Loss: {test_metrics['loss']:.6f} | "
@@ -669,6 +767,7 @@ def main(argv: List[str] | None = None) -> int:
         "scheduler": args.scheduler,
         "correction_mode": args.correction_mode,
         "accumulate_grad": args.accumulate_grad,
+        "weight_decay": args.weight_decay,
         "pretrained": args.pretrained,
         "from_scratch": args.from_scratch,
         "seed": args.seed,

@@ -265,6 +265,32 @@ def _check_logical_error(
 # Evaluation Loops
 # ---------------------------------------------------------------------------
 
+def _check_logical_errors_batch(
+    z_errors: np.ndarray,
+    x_errors: np.ndarray,
+    lx: np.ndarray,
+    lz: np.ndarray,
+    observables: np.ndarray,
+) -> np.ndarray:
+    """Vectorized logical error check for a batch of shots.
+
+    Args:
+        z_errors: (B, n) decoded Z-error estimates
+        x_errors: (B, n) decoded X-error estimates
+        lx: (k_x, n) X-type logical operators
+        lz: (k_z, n) Z-type logical operators
+        observables: (B, num_obs) actual observable flips
+
+    Returns:
+        (B,) bool array — True if logical error occurred
+    """
+    obs_from_z = (z_errors @ lx.T) % 2  # (B, k_x)
+    obs_from_x = (x_errors @ lz.T) % 2  # (B, k_z)
+    predicted = np.concatenate([obs_from_z, obs_from_x], axis=1)  # (B, k_x + k_z)
+    n_obs = min(predicted.shape[1], observables.shape[1])
+    return np.any(predicted[:, :n_obs] != observables[:, :n_obs], axis=1)
+
+
 def evaluate_code_capacity(
     npz_data: dict,
     meta: dict,
@@ -275,6 +301,9 @@ def evaluate_code_capacity(
     correction_mode: str = "additive",
 ) -> dict:
     """Evaluate decoders in code-capacity mode (separate CSS decoding).
+
+    Uses batched BP decoding for massive parallelism on CPU/GPU.
+    BP-OSD and MWPM use multiprocessing for CPU parallelism.
 
     Returns:
         Dictionary with results for each decoder.
@@ -317,129 +346,227 @@ def evaluate_code_capacity(
     else:
         num_rounds = 1
 
-    # Optionally load BP-OSD
+    # ---------- Preprocess ALL syndromes in bulk (vectorized) ----------
+    if num_rounds > 1:
+        syn_3d = syndromes.reshape(shots, num_rounds, total_checks)
+        collapsed = syn_3d.sum(axis=1) % 2
+    else:
+        collapsed = syndromes[:, :total_checks]
+
+    collapsed = collapsed.astype(np.float32)
+    all_x_syn = collapsed[:, :mx]   # (shots, mx)
+    all_z_syn = collapsed[:, mx:]   # (shots, mz)
+
+    # ---------- Batched BP decoding ----------
+    print("\nBatched BP decoding...")
+    t_start = time.time()
+
+    dec_z_pre = MinSumBPDecoder(hx, max_iter=100, alpha=0.8, clamp_llr=20.0).to(device)
+    dec_x_pre = MinSumBPDecoder(hz, max_iter=100, alpha=0.8, clamp_llr=20.0).to(device)
+
+    # Process in chunks to control memory (e.g. 512 shots per chunk)
+    CHUNK = 512
+    bp_hard_z_all = []
+    bp_hard_x_all = []
+    bp_conv_all = []
+
+    for start in range(0, shots, CHUNK):
+        end = min(start + CHUNK, shots)
+        x_syn_t = torch.from_numpy(all_x_syn[start:end]).float().to(device)
+        z_syn_t = torch.from_numpy(all_z_syn[start:end]).float().to(device)
+        B_chunk = end - start
+
+        llr_z_t = torch.full((B_chunk, n), llr_z, dtype=torch.float32, device=device)
+        llr_x_t = torch.full((B_chunk, n), llr_x, dtype=torch.float32, device=device)
+
+        with torch.no_grad():
+            _, hard_z, conv_z = dec_z_pre(x_syn_t, llr_z_t)
+            _, hard_x, conv_x = dec_x_pre(z_syn_t, llr_x_t)
+
+        bp_hard_z_all.append(hard_z.cpu().numpy())
+        bp_hard_x_all.append(hard_x.cpu().numpy())
+        bp_conv_all.append((conv_z & conv_x).cpu().numpy())
+
+        if end % max(1, shots // 5) < CHUNK:
+            elapsed = time.time() - t_start
+            print(f"  BP: {end}/{shots} shots ({end / elapsed:.0f} shots/s)")
+
+    bp_z_errors = np.concatenate(bp_hard_z_all, axis=0)  # (shots, n)
+    bp_x_errors = np.concatenate(bp_hard_x_all, axis=0)  # (shots, n)
+    bp_conv = np.concatenate(bp_conv_all, axis=0)         # (shots,)
+
+    bp_logical = _check_logical_errors_batch(bp_z_errors, bp_x_errors, lx, lz, observables)
+    bp_errors = int(bp_logical.sum())
+    bp_converged = int(bp_conv.sum())
+
+    bp_elapsed = time.time() - t_start
+    print(f"  BP done: {shots / bp_elapsed:.0f} shots/s")
+
+    # ---------- Batched GNN-BP decoding ----------
+    gnn_bp_errors = 0
+    gnn_bp_converged = 0
+    if gnn_model is not None:
+        print("Batched GNN-BP decoding...")
+        t_gnn = time.time()
+
+        # GNN runs per-shot (graph-level), but BP is batched after corrections
+        node_type_np, edge_index_np, edge_type_np = build_tanner_graph(hx, hz)
+        node_type_t = torch.from_numpy(node_type_np).long().to(device)
+        edge_index_t = torch.from_numpy(edge_index_np).long().to(device)
+        edge_type_t = torch.from_numpy(edge_type_np).long().to(device)
+        num_nodes = n + mx + mz
+
+        gnn_hard_z_all = []
+        gnn_hard_x_all = []
+        gnn_conv_all = []
+
+        for start in range(0, shots, CHUNK):
+            end = min(start + CHUNK, shots)
+            B_chunk = end - start
+
+            # Build per-shot GNN corrections
+            corrections_z = np.zeros((B_chunk, n), dtype=np.float32)
+            corrections_x = np.zeros((B_chunk, n), dtype=np.float32)
+
+            for i in range(B_chunk):
+                si = start + i
+                x_feat = torch.zeros(num_nodes, 4, dtype=torch.float32)
+                avg_llr = (llr_z + llr_x) / 2.0
+                x_feat[:n, 0] = avg_llr
+                x_feat[:n, 1] = 1.0
+                x_feat[n:n+mx, 0] = torch.from_numpy(all_x_syn[si]).float()
+                x_feat[n:n+mx, 2] = 1.0
+                x_feat[n+mx:, 0] = torch.from_numpy(all_z_syn[si]).float()
+                x_feat[n+mx:, 3] = 1.0
+
+                data_obj = Data(
+                    x=x_feat.to(device),
+                    edge_index=edge_index_t,
+                    edge_type=edge_type_t,
+                    node_type=node_type_t,
+                    channel_llr=torch.full((n,), avg_llr, dtype=torch.float32, device=device),
+                )
+
+                with torch.no_grad():
+                    gnn_model.eval()
+                    gnn_out = gnn_model(data_obj)
+
+                llr_z_s = torch.full((n,), llr_z, dtype=torch.float32, device=device)
+                llr_x_s = torch.full((n,), llr_x, dtype=torch.float32, device=device)
+
+                if correction_mode == "both":
+                    add_c, mul_c = gnn_out
+                    add_c = torch.clamp(add_c, -20.0, 20.0)
+                    mul_c = torch.clamp(mul_c, -5.0, 5.0)
+                    gnn_out = (add_c, mul_c)
+                else:
+                    gnn_out = torch.clamp(gnn_out, -20.0, 20.0)
+
+                corrections_z[i] = apply_correction(llr_z_s, gnn_out, correction_mode).cpu().numpy()
+                corrections_x[i] = apply_correction(llr_x_s, gnn_out, correction_mode).cpu().numpy()
+
+            # Batched BP with corrected LLRs
+            x_syn_t = torch.from_numpy(all_x_syn[start:end]).float().to(device)
+            z_syn_t = torch.from_numpy(all_z_syn[start:end]).float().to(device)
+            corr_z_t = torch.from_numpy(corrections_z).float().to(device)
+            corr_x_t = torch.from_numpy(corrections_x).float().to(device)
+
+            with torch.no_grad():
+                _, hard_z, conv_z = dec_z_pre(x_syn_t, corr_z_t)
+                _, hard_x, conv_x = dec_x_pre(z_syn_t, corr_x_t)
+
+            gnn_hard_z_all.append(hard_z.cpu().numpy())
+            gnn_hard_x_all.append(hard_x.cpu().numpy())
+            gnn_conv_all.append((conv_z & conv_x).cpu().numpy())
+
+            if end % max(1, shots // 5) < CHUNK:
+                elapsed = time.time() - t_gnn
+                print(f"  GNN-BP: {end}/{shots} shots ({end / elapsed:.0f} shots/s)")
+
+        gnn_z_errors = np.concatenate(gnn_hard_z_all, axis=0)
+        gnn_x_errors = np.concatenate(gnn_hard_x_all, axis=0)
+        gnn_conv = np.concatenate(gnn_conv_all, axis=0)
+
+        gnn_logical = _check_logical_errors_batch(gnn_z_errors, gnn_x_errors, lx, lz, observables)
+        gnn_bp_errors = int(gnn_logical.sum())
+        gnn_bp_converged = int(gnn_conv.sum())
+        print(f"  GNN-BP done: {shots / (time.time() - t_gnn):.0f} shots/s")
+
+    # ---------- BP-OSD (parallel with threads) ----------
+    # Use ThreadPoolExecutor: BP-OSD and MWPM are C-extension-backed
+    # (ldpc, pymatching) and release the GIL, so threads give true
+    # parallelism. ProcessPoolExecutor fails on Windows (can't pickle
+    # local functions with spawn).
+    bposd_errors = 0
     bposd_available = False
     if use_bposd:
         try:
             from gnn_pipeline.bposd_decoder import run_css_bposd_decoder
             bposd_available = True
-            print("BP-OSD decoder enabled")
         except ImportError as e:
             print(f"Warning: BP-OSD not available: {e}")
 
-    # Optionally load MWPM
+    if bposd_available:
+        import concurrent.futures
+        import os
+
+        print("BP-OSD decoding (parallel)...")
+        t_bposd = time.time()
+        n_workers = max(1, os.cpu_count() - 1)
+
+        def _bposd_shot(idx):
+            z_e, x_e = run_css_bposd_decoder(
+                all_x_syn[idx], all_z_syn[idx], hx, hz,
+                error_rate_z=pz, error_rate_x=px,
+            )
+            return _check_logical_error(z_e, x_e, lx, lz, observables[idx])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results_bposd = list(pool.map(_bposd_shot, range(shots)))
+
+        bposd_errors = sum(results_bposd)
+        print(f"  BP-OSD done: {shots / (time.time() - t_bposd):.0f} shots/s ({n_workers} workers)")
+
+    # ---------- MWPM (parallel with threads) ----------
+    mwpm_errors = 0
     mwpm_available = False
     if use_mwpm:
         try:
             from gnn_pipeline.matching_decoder import build_mwpm_css, run_mwpm_css
             matcher_z, matcher_x, emap_z, emap_x = build_mwpm_css(hx, hz, pz, px)
             mwpm_available = True
-            print("MWPM decoder enabled (approximate for LDPC codes)")
         except ImportError as e:
             print(f"Warning: MWPM not available: {e}")
 
-    # Pre-build BP decoders (reused across all shots -- major speedup)
-    print("Pre-building BP decoders...")
-    dec_z_pre = MinSumBPDecoder(hx, max_iter=100, alpha=0.8, clamp_llr=20.0).to(device)
-    dec_x_pre = MinSumBPDecoder(hz, max_iter=100, alpha=0.8, clamp_llr=20.0).to(device)
+    if mwpm_available:
+        import concurrent.futures
+        import os
 
-    # Pre-build Tanner graph for GNN (reused across all shots)
-    tanner_cache = None
-    if gnn_model is not None:
-        print("Pre-building Tanner graph...")
-        node_type_np, edge_index_np, edge_type_np = build_tanner_graph(hx, hz)
-        tanner_cache = (
-            torch.from_numpy(node_type_np).long().to(device),
-            torch.from_numpy(edge_index_np).long().to(device),
-            torch.from_numpy(edge_type_np).long().to(device),
-        )
+        print("MWPM decoding (parallel)...")
+        t_mwpm = time.time()
+        n_workers = max(1, os.cpu_count() - 1)
 
-    # Run evaluation
-    print("\nEvaluating...")
-    t_start = time.time()
-
-    bp_errors = 0
-    gnn_bp_errors = 0
-    bposd_errors = 0
-    mwpm_errors = 0
-    bp_converged = 0
-    gnn_bp_converged = 0
-
-    for shot_idx in range(shots):
-        det_row = syndromes[shot_idx]
-        observable = observables[shot_idx]
-
-        # Extract or collapse syndrome to (total_checks,)
-        if num_rounds > 1:
-            det_3d = det_row.reshape(num_rounds, total_checks)
-            syndrome = det_3d.sum(axis=0) % 2
-        else:
-            syndrome = det_row[:total_checks]
-
-        syndrome = syndrome.astype(np.float32)
-        x_syndrome = syndrome[:mx]
-        z_syndrome = syndrome[mx:]
-
-        # --- BP (separate CSS decoding) ---
-        z_err, x_err, z_conv, x_conv = run_css_bp_decoder(
-            x_syndrome, z_syndrome, hx, hz, llr_z, llr_x, n, device,
-            dec_z_prebuilt=dec_z_pre, dec_x_prebuilt=dec_x_pre,
-        )
-        both_conv = z_conv and x_conv
-        bp_converged += int(both_conv)
-        bp_logical_error = _check_logical_error(z_err, x_err, lx, lz, observable)
-        bp_errors += int(bp_logical_error)
-
-        # --- GNN-BP ---
-        if gnn_model is not None:
-            z_err_g, x_err_g, z_conv_g, x_conv_g = run_gnn_css_bp_decoder(
-                x_syndrome, z_syndrome, hx, hz, llr_z, llr_x, n,
-                gnn_model, device, correction_mode=correction_mode,
-                dec_z_prebuilt=dec_z_pre, dec_x_prebuilt=dec_x_pre,
-                tanner_graph=tanner_cache,
-            )
-            both_conv_g = z_conv_g and x_conv_g
-            gnn_bp_converged += int(both_conv_g)
-            gnn_bp_logical_error = _check_logical_error(
-                z_err_g, x_err_g, lx, lz, observable
-            )
-            gnn_bp_errors += int(gnn_bp_logical_error)
-
-        # --- BP-OSD ---
-        if bposd_available:
-            z_err_o, x_err_o = run_css_bposd_decoder(
-                x_syndrome, z_syndrome, hx, hz,
-                error_rate_z=pz, error_rate_x=px,
-            )
-            bposd_logical_error = _check_logical_error(
-                z_err_o, x_err_o, lx, lz, observable
-            )
-            bposd_errors += int(bposd_logical_error)
-
-        # --- MWPM ---
-        if mwpm_available:
-            z_err_m, x_err_m = run_mwpm_css(
-                x_syndrome, z_syndrome, matcher_z, matcher_x, n,
+        def _mwpm_shot(idx):
+            z_e, x_e = run_mwpm_css(
+                all_x_syn[idx], all_z_syn[idx], matcher_z, matcher_x, n,
                 edge_map_z=emap_z, edge_map_x=emap_x,
             )
-            mwpm_logical_error = _check_logical_error(
-                z_err_m, x_err_m, lx, lz, observable
-            )
-            mwpm_errors += int(mwpm_logical_error)
+            return _check_logical_error(z_e, x_e, lx, lz, observables[idx])
 
-        if (shot_idx + 1) % max(1, shots // 10) == 0:
-            elapsed = time.time() - t_start
-            rate = (shot_idx + 1) / elapsed
-            print(f"  Processed {shot_idx + 1}/{shots} shots ({rate:.1f} shots/s)")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results_mwpm = list(pool.map(_mwpm_shot, range(shots)))
+
+        mwpm_errors = sum(results_mwpm)
+        print(f"  MWPM done: {shots / (time.time() - t_mwpm):.0f} shots/s ({n_workers} workers)")
 
     elapsed = time.time() - t_start
 
-    # Compute LER with confidence intervals
+    # ---------- Report results ----------
     bp_ler = bp_errors / shots if shots > 0 else 0.0
     bp_ler_low, bp_ler_high = wilson_score_interval_binom(bp_errors, shots)
 
     print(f"\n=== Results ({elapsed:.1f}s) ===")
-    print(f"BP Decoder (separate CSS):")
+    print(f"BP Decoder (separate CSS, batched):")
     print(f"  Logical Error Rate: {bp_ler:.6f}")
     print(f"  95% CI: [{bp_ler_low:.6f}, {bp_ler_high:.6f}]")
     print(f"  Errors: {bp_errors}/{shots}")
@@ -464,7 +591,7 @@ def evaluate_code_capacity(
         gnn_bp_ler = gnn_bp_errors / shots if shots > 0 else 0.0
         gnn_bp_ler_low, gnn_bp_ler_high = wilson_score_interval_binom(gnn_bp_errors, shots)
 
-        print(f"\nGNN-Assisted BP (separate CSS):")
+        print(f"\nGNN-Assisted BP (separate CSS, batched):")
         print(f"  Logical Error Rate: {gnn_bp_ler:.6f}")
         print(f"  95% CI: [{gnn_bp_ler_low:.6f}, {gnn_bp_ler_high:.6f}]")
         print(f"  Errors: {gnn_bp_errors}/{shots}")
@@ -486,7 +613,7 @@ def evaluate_code_capacity(
         bposd_ler = bposd_errors / shots if shots > 0 else 0.0
         bposd_ler_low, bposd_ler_high = wilson_score_interval_binom(bposd_errors, shots)
 
-        print(f"\nBP-OSD Decoder (separate CSS):")
+        print(f"\nBP-OSD Decoder (separate CSS, parallel):")
         print(f"  Logical Error Rate: {bposd_ler:.6f}")
         print(f"  95% CI: [{bposd_ler_low:.6f}, {bposd_ler_high:.6f}]")
         print(f"  Errors: {bposd_errors}/{shots}")
@@ -505,7 +632,7 @@ def evaluate_code_capacity(
         mwpm_ler = mwpm_errors / shots if shots > 0 else 0.0
         mwpm_ler_low, mwpm_ler_high = wilson_score_interval_binom(mwpm_errors, shots)
 
-        print(f"\nMWPM Decoder (separate CSS, approximate for LDPC):")
+        print(f"\nMWPM Decoder (separate CSS, parallel, approximate for LDPC):")
         print(f"  Logical Error Rate: {mwpm_ler:.6f}")
         print(f"  95% CI: [{mwpm_ler_low:.6f}, {mwpm_ler_high:.6f}]")
         print(f"  Errors: {mwpm_errors}/{shots}")

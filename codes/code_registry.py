@@ -1,20 +1,10 @@
-"""Registry of known bivariate bicycle QLDPC codes.
 
-Each entry specifies the parameters for create_bivariate_bicycle_codes(l, m, ...)
-which produces a code with n = 2*l*m physical qubits.
-
-Usage:
-    from codes.code_registry import get_code_params, list_codes
-
-    params = get_code_params("72_12_6")
-    css, A_list, B_list = create_bivariate_bicycle_codes(**params)
-"""
 from __future__ import annotations
 
 from typing import Dict, List
 
 
-# Parameters verified empirically via create_bivariate_bicycle_codes()
+# parameters verified empirically via create_bivariate_bicycle_codes()
 CODE_CATALOG: Dict[str, dict] = {
     "72_12_6": {
         "l": 6,

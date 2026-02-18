@@ -32,7 +32,7 @@ def weighted_bce_loss(
     """
     eps = 1e-7
     marginals_c = marginals.clamp(eps, 1.0 - eps)
-    logits = torch.log(marginals_c / (1.0 - marginals_c))
+    logits = torch.logit(marginals_c)  # numerically stable logit
     pw = torch.tensor([pos_weight], device=marginals.device, dtype=marginals.dtype)
     return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pw)
 
@@ -109,15 +109,24 @@ def logical_aware_loss(
     # P(logical flip from Z) = 0.5 * (1 - prod_j(1 - 2*p_j) for j in support(lx_row))
     def soft_logical_flip(marginals, logicals):
         # marginals: (B, n), logicals: (k, n)
-        # For each logical row, compute product of (1 - 2*p_j) over support
+        # Compute in log-domain for numerical stability:
+        #   prod(1-2p_j) = exp(sum(log|1-2p_j|)) * sign_product
+        # P(flip) = 0.5 * (1 - prod(1-2p_j))
         eps = 1e-7
         p = marginals.clamp(eps, 1.0 - eps)
-        # (B, k, n) = (B, 1, n) * (1, k, n)
-        factor = 1.0 - 2.0 * p.unsqueeze(1)  # (B, 1, n)
+        factor = 1.0 - 2.0 * p  # (B, n), range (-1, 1)
         log_mask = logicals.unsqueeze(0).float()  # (1, k, n)
-        # Where logical has support, use factor; elsewhere use 1.0
-        masked = factor * log_mask + (1.0 - log_mask)
-        prod_val = masked.prod(dim=2)  # (B, k)
+
+        # Log-domain product: sum log|factor| over support
+        log_abs_factor = torch.log(factor.abs().clamp(min=eps)).unsqueeze(1)  # (B, 1, n)
+        log_prod = (log_abs_factor * log_mask).sum(dim=2)  # (B, k)
+
+        # Sign product over support
+        sign_factor = torch.sign(factor).unsqueeze(1)  # (B, 1, n)
+        sign_masked = sign_factor * log_mask + (1.0 - log_mask)  # 1.0 for non-support
+        sign_prod = sign_masked.prod(dim=2)  # (B, k)
+
+        prod_val = sign_prod * torch.exp(log_prod)
         flip_prob = 0.5 * (1.0 - prod_val)  # (B, k)
         return flip_prob.clamp(0.0, 1.0)
 
@@ -132,3 +141,48 @@ def logical_aware_loss(
     logical_loss = F.mse_loss(pred_z_flip, gt_z_flip) + F.mse_loss(pred_x_flip, gt_x_flip)
 
     return base + logical_weight * logical_loss
+
+
+def syndrome_consistency_loss(
+    marginals: torch.Tensor,
+    syndrome: torch.Tensor,
+    pcm: torch.Tensor,
+) -> torch.Tensor:
+    """Soft syndrome consistency: penalize mismatch between predicted errors and syndrome.
+
+    Uses the differentiable XOR probability formula to compute the expected syndrome
+    from soft marginals, then penalizes deviation from the actual syndrome.
+
+    This gives the GNN direct gradient signal about whether its corrections lead to
+    syndrome-consistent decoding.
+
+    Args:
+        marginals: (B, n) soft error probabilities from BP
+        syndrome: (B, m) actual syndrome bits
+        pcm: (m, n) parity-check matrix
+    """
+    eps = 1e-7
+    p = marginals.clamp(eps, 1.0 - eps)  # (B, n)
+    # For each check row, compute P(odd parity) = 0.5 * (1 - prod(1 - 2*p_j))
+    # In log domain for stability
+    factor = 1.0 - 2.0 * p  # (B, n)
+    log_abs = torch.log(factor.abs().clamp(min=eps))  # (B, n)
+    pcm_f = pcm.float()  # (m, n)
+
+    # Sum log|1-2p_j| over support of each check
+    log_prod = log_abs @ pcm_f.t()  # (B, m)
+
+    # Sign product: even number of negatives -> positive
+    sign_factor = torch.sign(factor)  # (B, n)
+    # Count negative signs per check (where pcm has 1s)
+    # sign(prod) = prod(sign_j) for j in support
+    # Use log-domain trick: sum of log(sign) doesn't work, but we can use:
+    # sign_prod = (-1)^(number of negative factors in support)
+    neg_count = ((sign_factor < 0).float()) @ pcm_f.t()  # (B, m)
+    sign_prod = 1.0 - 2.0 * (neg_count % 2)  # (B, m)
+
+    prod_val = sign_prod * torch.exp(log_prod)
+    predicted_syn = 0.5 * (1.0 - prod_val)  # (B, m)
+    predicted_syn = predicted_syn.clamp(0.0, 1.0)
+
+    return F.binary_cross_entropy(predicted_syn, syndrome)
