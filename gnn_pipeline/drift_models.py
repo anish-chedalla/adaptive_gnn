@@ -104,6 +104,7 @@ def generate_drift_sequence(
     sigma: float = 0.005,
     p_delta: float = 0.01,
     switch_prob: float = 0.005,
+    **kwargs,
 ) -> np.ndarray:
     """Dispatcher: generate a per-shot error rate sequence.
 

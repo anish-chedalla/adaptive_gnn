@@ -53,6 +53,10 @@ def _decode_all_shots(
     gnn_model: Optional[torch.nn.Module] = None,
     use_bposd: bool = False,
     use_mwpm: bool = False,
+    use_bplsd: bool = False,
+    use_belieffind: bool = False,
+    lsd_order: int = 0,
+    lsd_method: str = "LSD_CS",
 ) -> dict:
     """Decode all shots and return results for each decoder.
 
@@ -261,6 +265,61 @@ def _decode_all_shots(
             results_mwpm = list(pool.map(_mwpm_shot, range(shots)))
         mwpm_errors = sum(results_mwpm)
 
+    # ---------- BP-LSD (parallel with threads) ----------
+    bplsd_errors = 0
+    bplsd_available = False
+    if use_bplsd:
+        try:
+            from gnn_pipeline.bplsd_decoder import run_css_bplsd_decoder
+            bplsd_available = True
+        except ImportError:
+            pass
+
+    if bplsd_available:
+        import concurrent.futures
+        import os
+
+        n_workers = max(1, os.cpu_count() - 1)
+
+        def _bplsd_shot(idx):
+            z_e, x_e = run_css_bplsd_decoder(
+                all_x_syn[idx], all_z_syn[idx], hx, hz,
+                error_rate_z=pz, error_rate_x=px,
+                lsd_order=lsd_order, lsd_method=lsd_method,
+            )
+            return _check_logical_error(z_e, x_e, lx, lz, observables[idx])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results_bplsd = list(pool.map(_bplsd_shot, range(shots)))
+        bplsd_errors = sum(results_bplsd)
+
+    # ---------- BeliefFind (parallel with threads) ----------
+    bf_errors = 0
+    bf_available = False
+    if use_belieffind:
+        try:
+            from gnn_pipeline.bplsd_decoder import run_css_belief_find_decoder
+            bf_available = True
+        except ImportError:
+            pass
+
+    if bf_available:
+        import concurrent.futures
+        import os
+
+        n_workers = max(1, os.cpu_count() - 1)
+
+        def _bf_shot(idx):
+            z_e, x_e = run_css_belief_find_decoder(
+                all_x_syn[idx], all_z_syn[idx], hx, hz,
+                error_rate_z=pz, error_rate_x=px,
+            )
+            return _check_logical_error(z_e, x_e, lx, lz, observables[idx])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results_bf = list(pool.map(_bf_shot, range(shots)))
+        bf_errors = sum(results_bf)
+
     # ---------- Build result dict ----------
     result = {
         "bp": {
@@ -285,6 +344,16 @@ def _decode_all_shots(
             "errors": mwpm_errors,
             "shots": shots,
         }
+    if bplsd_available:
+        result["bplsd"] = {
+            "errors": bplsd_errors,
+            "shots": shots,
+        }
+    if bf_available:
+        result["belieffind"] = {
+            "errors": bf_errors,
+            "shots": shots,
+        }
 
     return result
 
@@ -304,6 +373,8 @@ def _make_plots(
     has_gnn: bool,
     has_bposd: bool,
     has_mwpm: bool = False,
+    has_bplsd: bool = False,
+    has_belieffind: bool = False,
 ):
     """Generate threshold plots from sweep results."""
     import matplotlib
@@ -360,6 +431,28 @@ def _make_plots(
             mwpm_err_hi = [max(0.0, hi - l) for l, hi in zip(mwpm_ler, mwpm_hi)]
             ax.errorbar(p_vals, mwpm_ler, yerr=[mwpm_err_lo, mwpm_err_hi],
                          marker='D', capsize=4, label='MWPM', linewidth=2)
+
+        # BP-LSD
+        if has_bplsd and "bplsd" in results_list[0]:
+            bplsd_ler = [r["bplsd"]["ler"] for r in results_list]
+            bplsd_lo = [r["bplsd"]["ci_low"] for r in results_list]
+            bplsd_hi = [r["bplsd"]["ci_high"] for r in results_list]
+            bplsd_err_lo = [max(0.0, l - lo) for l, lo in zip(bplsd_ler, bplsd_lo)]
+            bplsd_err_hi = [max(0.0, hi - l) for l, hi in zip(bplsd_ler, bplsd_hi)]
+            ax.errorbar(p_vals, bplsd_ler, yerr=[bplsd_err_lo, bplsd_err_hi],
+                         marker='v', capsize=4, label='BP-LSD', linewidth=2,
+                         color='#E74C3C')
+
+        # BeliefFind
+        if has_belieffind and "belieffind" in results_list[0]:
+            bf_ler = [r["belieffind"]["ler"] for r in results_list]
+            bf_lo = [r["belieffind"]["ci_low"] for r in results_list]
+            bf_hi = [r["belieffind"]["ci_high"] for r in results_list]
+            bf_err_lo = [max(0.0, l - lo) for l, lo in zip(bf_ler, bf_lo)]
+            bf_err_hi = [max(0.0, hi - l) for l, hi in zip(bf_ler, bf_hi)]
+            ax.errorbar(p_vals, bf_ler, yerr=[bf_err_lo, bf_err_hi],
+                         marker='P', capsize=4, label='BeliefFind', linewidth=2,
+                         color='#9B59B6')
 
         label = noise_type.replace("_", " ").title()
         ax.set_xlabel("Physical error rate p", fontsize=13)
@@ -476,6 +569,16 @@ def _make_plots(
                 mwpm_ler = [r["mwpm"]["ler"] for r in results_list]
                 ax.plot(p_vals, mwpm_ler, marker='D', label='MWPM', linewidth=2)
 
+            if has_bplsd and "bplsd" in results_list[0]:
+                bplsd_ler = [r["bplsd"]["ler"] for r in results_list]
+                ax.plot(p_vals, bplsd_ler, marker='v', label='BP-LSD', linewidth=2,
+                        color='#E74C3C')
+
+            if has_belieffind and "belieffind" in results_list[0]:
+                bf_ler = [r["belieffind"]["ler"] for r in results_list]
+                ax.plot(p_vals, bf_ler, marker='P', label='BeliefFind', linewidth=2,
+                        color='#9B59B6')
+
             ax.set_xlabel("Physical error rate p", fontsize=13)
             ax.set_title(title, fontsize=14)
             ax.set_yscale("log")
@@ -518,6 +621,15 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--bposd", action="store_true", help="Enable BP-OSD baseline")
     parser.add_argument("--mwpm", action="store_true",
                         help="Enable MWPM baseline (approximate for LDPC codes)")
+    parser.add_argument("--bplsd", action="store_true",
+                        help="Enable BP-LSD decoder (stronger than BP-OSD for LDPC codes)")
+    parser.add_argument("--belieffind", action="store_true",
+                        help="Enable BeliefFind (BP + Union Find) decoder")
+    parser.add_argument("--lsd_order", type=int, default=0,
+                        help="LSD order for BP-LSD (0=fastest)")
+    parser.add_argument("--lsd_method", type=str, default="LSD_CS",
+                        choices=["LSD_0", "LSD_E", "LSD_CS"],
+                        help="LSD method for BP-LSD decoder")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
     parser.add_argument("--out_dir", type=str, required=True, help="Output directory")
 
@@ -546,10 +658,15 @@ def main(argv: List[str] | None = None) -> int:
             gnn_model = TannerGNN(
                 hidden_dim=checkpoint.get("hidden_dim", 64),
                 num_mp_layers=checkpoint.get("num_mp_layers", 3),
+                correction_mode=checkpoint.get("correction_mode", "additive"),
+                use_residual=checkpoint.get("use_residual", False),
+                use_layer_norm=checkpoint.get("use_layer_norm", False),
+                use_attention=checkpoint.get("use_attention", False),
             )
             gnn_model.load_state_dict(checkpoint["model_state_dict"])
             print(f"  Loaded checkpoint (hidden_dim={checkpoint.get('hidden_dim', 64)}, "
-                  f"num_mp_layers={checkpoint.get('num_mp_layers', 3)})")
+                  f"num_mp_layers={checkpoint.get('num_mp_layers', 3)}, "
+                  f"attention={checkpoint.get('use_attention', False)})")
         else:
             gnn_model = TannerGNN()
             gnn_model.load_state_dict(checkpoint)
@@ -647,6 +764,8 @@ def main(argv: List[str] | None = None) -> int:
                 p=p_val, eta=args.eta, device=device,
                 gnn_model=gnn_model, use_bposd=args.bposd,
                 use_mwpm=args.mwpm,
+                use_bplsd=args.bplsd, use_belieffind=args.belieffind,
+                lsd_order=args.lsd_order, lsd_method=args.lsd_method,
             )
             elapsed = time.time() - t0
 
@@ -730,6 +849,10 @@ def main(argv: List[str] | None = None) -> int:
             "gnn_model": args.gnn_model,
             "bposd": args.bposd,
             "mwpm": args.mwpm,
+            "bplsd": args.bplsd,
+            "belieffind": args.belieffind,
+            "lsd_order": args.lsd_order,
+            "lsd_method": args.lsd_method,
         },
         "code": {"n": int(n), "mx": int(mx), "mz": int(mz), "k": int(lx.shape[0])},
         "results": all_results,
@@ -758,6 +881,8 @@ def main(argv: List[str] | None = None) -> int:
         has_gnn=(gnn_model is not None),
         has_bposd=args.bposd,
         has_mwpm=args.mwpm,
+        has_bplsd=args.bplsd,
+        has_belieffind=args.belieffind,
     )
 
     # Clean up partial file after successful completion

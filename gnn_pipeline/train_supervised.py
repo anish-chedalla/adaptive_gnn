@@ -121,6 +121,7 @@ def train_epoch(
     syn_weight: float = 0.0,
     hx_t: torch.Tensor | None = None,
     hz_t: torch.Tensor | None = None,
+    augment: bool = False,
 ) -> dict:
     """Train for one epoch on supervised loss through differentiable BP.
 
@@ -168,6 +169,13 @@ def train_epoch(
             # Extract CSS syndromes
             x_syndrome = target_syn[:, :mx]   # X-checks detect Z-errors
             z_syndrome = target_syn[:, mx:]   # Z-checks detect X-errors
+
+            # Syndrome augmentation: randomly flip bits with p=0.01
+            if augment:
+                flip_mask_x = (torch.rand_like(x_syndrome) < 0.01).float()
+                flip_mask_z = (torch.rand_like(z_syndrome) < 0.01).float()
+                x_syndrome = torch.abs(x_syndrome - flip_mask_x)
+                z_syndrome = torch.abs(z_syndrome - flip_mask_z)
 
             # Differentiable BP forward
             marginals_z, hard_z, conv_z = dec_z(x_syndrome, corrected_llr_z)
@@ -424,6 +432,31 @@ def main(argv: List[str] | None = None) -> int:
         help="Enable layer normalization in GNN message-passing layers",
     )
     parser.add_argument(
+        "--use_attention", action="store_true",
+        help="Enable attention-weighted message passing in GNN",
+    )
+    parser.add_argument(
+        "--curriculum", action="store_true",
+        help="Enable curriculum learning: start with easy (low-p) data, add harder gradually",
+    )
+    parser.add_argument(
+        "--loss_phase2", type=str, default=None,
+        choices=["mse", "bce", "weighted_bce", "focal", "logical_mse", "logical_bce"],
+        help="Switch to this loss after --phase2_epoch (default: disabled)",
+    )
+    parser.add_argument(
+        "--phase2_epoch", type=int, default=5,
+        help="Epoch to switch to phase2 loss (default: 5)",
+    )
+    parser.add_argument(
+        "--augment", action="store_true",
+        help="Enable syndrome bit-flip augmentation (p=0.01 per bit)",
+    )
+    parser.add_argument(
+        "--learnable_alpha", action="store_true",
+        help="Make BP damping factor (alpha) a learnable parameter, jointly optimized with GNN",
+    )
+    parser.add_argument(
         "--out_dir", type=str, required=True,
         help="Output directory for checkpoints and logs",
     )
@@ -525,11 +558,20 @@ def main(argv: List[str] | None = None) -> int:
     dec_x = MinSumBPDecoder(
         hz.astype(np.uint8), max_iter=args.bp_iters, alpha=0.8, clamp_llr=20.0
     ).to(device)
-    # Freeze BP decoder parameters (they have no learnable params, but be safe)
+    # Freeze BP decoder buffers (they have no learnable params by default)
     for p in dec_z.parameters():
         p.requires_grad = False
     for p in dec_x.parameters():
         p.requires_grad = False
+
+    # Learnable alpha: make BP damping factor a trainable parameter
+    alpha_params = []
+    if args.learnable_alpha:
+        alpha_z = dec_z.make_alpha_learnable()
+        alpha_x = dec_x.make_alpha_learnable()
+        alpha_params = [alpha_z, alpha_x]
+        print(f"  Learnable BP alpha enabled (init={alpha_z.item():.2f})")
+
     print(f"  dec_z (hx): {dec_z.num_checks}x{dec_z.num_vars}, {dec_z.num_edges} edges")
     print(f"  dec_x (hz): {dec_x.num_checks}x{dec_x.num_vars}, {dec_x.num_edges} edges")
 
@@ -538,6 +580,9 @@ def main(argv: List[str] | None = None) -> int:
         hidden_dim=args.hidden_dim,
         num_mp_layers=args.num_mp_layers,
         correction_mode=args.correction_mode,
+        use_residual=args.use_residual,
+        use_layer_norm=args.use_layer_norm,
+        use_attention=args.use_attention,
     )
 
     if args.pretrained and not args.from_scratch:
@@ -556,10 +601,11 @@ def main(argv: List[str] | None = None) -> int:
     print(f"Model: {n_params:,} trainable parameters")
 
     # Optimizer and scheduler
+    all_params = list(model.parameters()) + alpha_params
     if args.weight_decay > 0:
-        optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = AdamW(all_params, lr=args.lr, weight_decay=args.weight_decay)
     else:
-        optimizer = Adam(model.parameters(), lr=args.lr)
+        optimizer = Adam(all_params, lr=args.lr)
     scheduler = None
     if args.scheduler == "cosine":
         if args.warmup_epochs > 0:
@@ -602,9 +648,48 @@ def main(argv: List[str] | None = None) -> int:
         test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False)
         print(f"Test set: {len(test_data)} samples (evaluated after training)")
 
+    # Curriculum learning: extract p_value per sample for difficulty sorting
+    curriculum_loaders = None
+    if args.curriculum:
+        # Each graph in train_data has a channel_llr attribute;
+        # we can infer p from it: p = sigmoid(-llr) ~ 1/(1+exp(llr))
+        # Group samples by difficulty tiers
+        p_thresholds = [0.02, 0.03, 1.0]  # tier boundaries
+        tier_indices = [[] for _ in range(len(p_thresholds))]
+        for idx, sample in enumerate(train_data):
+            # Average channel LLR -> infer approximate p
+            avg_llr = sample.channel_llr.mean().item() if hasattr(sample, 'channel_llr') else 10.0
+            approx_p = 1.0 / (1.0 + np.exp(avg_llr))
+            for tier_idx, thresh in enumerate(p_thresholds):
+                if approx_p <= thresh:
+                    tier_indices[tier_idx].append(idx)
+                    break
+
+        # Create cumulative subsets: tier0, tier0+1, tier0+1+2
+        from torch.utils.data import Subset
+        curriculum_loaders = []
+        cumulative = []
+        for tier_idx in range(len(p_thresholds)):
+            cumulative.extend(tier_indices[tier_idx])
+            subset = Subset(train_data, list(cumulative))
+            loader = DataLoader(subset, batch_size=args.batch_size, shuffle=True)
+            curriculum_loaders.append(loader)
+        tier_sizes = [len(t) for t in tier_indices]
+        print(f"Curriculum learning: {len(p_thresholds)} tiers with {tier_sizes} samples")
+        print(f"  Epochs 1-3: easy only ({sum(tier_sizes[:1])} samples)")
+        print(f"  Epochs 4-6: easy+medium ({sum(tier_sizes[:2])} samples)")
+        print(f"  Epochs 7+: all ({sum(tier_sizes)} samples)")
+
     # Training loop
     patience_str = f", patience={args.patience}" if args.patience > 0 else ""
-    print(f"\nTraining for {args.epochs} epochs (loss={args.loss}, bp_iters={args.bp_iters}{patience_str})...")
+    extra_info = ""
+    if args.curriculum:
+        extra_info += ", curriculum"
+    if args.loss_phase2:
+        extra_info += f", phase2={args.loss_phase2}@epoch{args.phase2_epoch}"
+    if args.augment:
+        extra_info += ", augment"
+    print(f"\nTraining for {args.epochs} epochs (loss={args.loss}, bp_iters={args.bp_iters}{patience_str}{extra_info})...")
     print("-" * 90)
     best_val_loss = float("inf")
     patience_counter = 0
@@ -616,10 +701,26 @@ def main(argv: List[str] | None = None) -> int:
     for epoch in range(args.epochs):
         t_epoch = time.time()
 
+        # Curriculum: select appropriate loader
+        if curriculum_loaders is not None:
+            if epoch < 3:
+                current_loader = curriculum_loaders[0]
+            elif epoch < 6:
+                current_loader = curriculum_loaders[min(1, len(curriculum_loaders) - 1)]
+            else:
+                current_loader = curriculum_loaders[-1]
+        else:
+            current_loader = train_loader
+
+        # Loss phase switching
+        current_loss = args.loss
+        if args.loss_phase2 and epoch >= args.phase2_epoch:
+            current_loss = args.loss_phase2
+
         train_metrics = train_epoch(
-            model, train_loader, optimizer, device,
+            model, current_loader, optimizer, device,
             dec_z, dec_x, n_qubits, mx, mz,
-            loss_fn=args.loss, grad_clip=args.grad_clip,
+            loss_fn=current_loss, grad_clip=args.grad_clip,
             pos_weight=args.pos_weight,
             focal_alpha=args.focal_alpha,
             focal_gamma=args.focal_gamma,
@@ -629,11 +730,12 @@ def main(argv: List[str] | None = None) -> int:
             correction_mode=args.correction_mode,
             scaler=scaler, use_amp=use_amp,
             syn_weight=args.syn_weight, hx_t=hx_t, hz_t=hz_t,
+            augment=args.augment,
         )
         val_metrics = eval_epoch(
             model, val_loader, device,
             dec_z, dec_x, n_qubits, mx, mz,
-            loss_fn=args.loss,
+            loss_fn=current_loss,
             pos_weight=args.pos_weight,
             focal_alpha=args.focal_alpha,
             focal_gamma=args.focal_gamma,
@@ -649,13 +751,20 @@ def main(argv: List[str] | None = None) -> int:
         elapsed = time.time() - t_epoch
         lr_now = optimizer.param_groups[0]["lr"]
 
+        alpha_str = ""
+        if args.learnable_alpha:
+            alpha_val = dec_z.effective_alpha
+            if isinstance(alpha_val, torch.Tensor):
+                alpha_val = alpha_val.item()
+            alpha_str = f" | alpha: {alpha_val:.4f}"
+
         print(
             f"Epoch {epoch+1:2d}/{args.epochs} | "
             f"Train Loss: {train_metrics['loss']:.6f} | "
             f"Val Loss: {val_metrics['loss']:.6f} | "
             f"BitAcc Z: {val_metrics['bit_acc_z']:.4f} X: {val_metrics['bit_acc_x']:.4f} | "
             f"Conv Z: {val_metrics['convergence_z']:.3f} X: {val_metrics['convergence_x']:.3f} | "
-            f"LR: {lr_now:.2e} | {elapsed:.1f}s"
+            f"LR: {lr_now:.2e}{alpha_str} | {elapsed:.1f}s"
         )
 
         epoch_record = {
@@ -672,8 +781,16 @@ def main(argv: List[str] | None = None) -> int:
             best_val_loss = val_metrics["loss"]
             patience_counter = 0
 
-            # Raw state dict (backward-compatible with evaluate.py)
-            torch.save(model.state_dict(), str(out_dir / "best_model.pt"))
+            # Save best_model.pt with architecture info for evaluate.py
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "hidden_dim": args.hidden_dim,
+                "num_mp_layers": args.num_mp_layers,
+                "correction_mode": args.correction_mode,
+                "use_residual": args.use_residual,
+                "use_layer_norm": args.use_layer_norm,
+                "use_attention": args.use_attention,
+            }, str(out_dir / "best_model.pt"))
 
             # Rich checkpoint with architecture info + optimizer state
             ckpt = {
@@ -683,6 +800,9 @@ def main(argv: List[str] | None = None) -> int:
                 "num_mp_layers": args.num_mp_layers,
                 "node_feat_dim": 4, "edge_types": 2, "dropout": 0.1,
                 "correction_mode": args.correction_mode,
+                "use_residual": args.use_residual,
+                "use_layer_norm": args.use_layer_norm,
+                "use_attention": args.use_attention,
                 "bp_iters": args.bp_iters,
                 "loss_fn": args.loss,
                 "epoch": epoch + 1,
@@ -712,12 +832,25 @@ def main(argv: List[str] | None = None) -> int:
           f"{epochs_completed}/{args.epochs} epochs")
     print(f"Best validation loss: {best_val_loss:.6f}")
 
-    # Save final model
-    torch.save(model.state_dict(), str(out_dir / "final_model.pt"))
+    # Save final model (with architecture info)
     torch.save({
         "model_state_dict": model.state_dict(),
         "hidden_dim": args.hidden_dim,
         "num_mp_layers": args.num_mp_layers,
+        "correction_mode": args.correction_mode,
+        "use_residual": args.use_residual,
+        "use_layer_norm": args.use_layer_norm,
+        "use_attention": args.use_attention,
+        "epoch": epochs_completed,
+    }, str(out_dir / "final_model.pt"))
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "hidden_dim": args.hidden_dim,
+        "num_mp_layers": args.num_mp_layers,
+        "correction_mode": args.correction_mode,
+        "use_residual": args.use_residual,
+        "use_layer_norm": args.use_layer_norm,
+        "use_attention": args.use_attention,
         "epoch": epochs_completed,
     }, str(out_dir / "final_checkpoint.pt"))
 

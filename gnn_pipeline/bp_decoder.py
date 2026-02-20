@@ -35,8 +35,10 @@ class MinSumBPDecoder(nn.Module):
     ):
         super().__init__()
         self.max_iter = max_iter
-        self.alpha = alpha
+        self._alpha_init = alpha
         self.clamp_llr = clamp_llr
+        # Default: fixed alpha. Use make_alpha_learnable() to make it a parameter.
+        self.alpha = alpha
 
         pcm = np.asarray(pcm, dtype=np.uint8)
         assert pcm.ndim == 2
@@ -86,6 +88,23 @@ class MinSumBPDecoder(nn.Module):
         # Sparse PCM for fast syndrome check (replaces Python edge loop)
         pcm_sparse = torch.from_numpy(pcm.astype(np.float32))
         self.register_buffer("pcm_dense", pcm_sparse)  # (m, n)
+
+    def make_alpha_learnable(self) -> nn.Parameter:
+        """Convert fixed alpha to a learnable nn.Parameter.
+
+        Returns the parameter so it can be included in optimizer param groups.
+        """
+        self.alpha_param = nn.Parameter(torch.tensor(self._alpha_init))
+        self.alpha = None  # Signal to use alpha_param in forward
+        return self.alpha_param
+
+    @property
+    def effective_alpha(self) -> torch.Tensor:
+        """Get the current alpha value (fixed float or learnable parameter)."""
+        if self.alpha is not None:
+            return self.alpha
+        # Learnable alpha: clamp to (0, 1) via sigmoid
+        return torch.sigmoid(self.alpha_param)
 
     def forward(
         self,
@@ -159,7 +178,7 @@ class MinSumBPDecoder(nn.Module):
             excl_min = torch.where(is_min, min2.expand_as(abs_vtc_masked), min1.expand_as(abs_vtc_masked))
 
             # CTV message: alpha * excl_sign * excl_min
-            ctv_new = self.alpha * excl_sign * excl_min
+            ctv_new = self.effective_alpha * excl_sign * excl_min
             ctv_new = ctv_new * self.check_adj_mask.unsqueeze(0)  # zero padding
 
             # Scatter back: ctv_new is (B, m, max_check_deg) indexed by check_adj

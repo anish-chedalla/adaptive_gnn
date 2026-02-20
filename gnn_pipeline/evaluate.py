@@ -298,7 +298,11 @@ def evaluate_code_capacity(
     gnn_model: Optional[nn.Module] = None,
     use_bposd: bool = False,
     use_mwpm: bool = False,
+    use_bplsd: bool = False,
+    use_belieffind: bool = False,
     correction_mode: str = "additive",
+    lsd_order: int = 0,
+    lsd_method: str = "LSD_CS",
 ) -> dict:
     """Evaluate decoders in code-capacity mode (separate CSS decoding).
 
@@ -337,8 +341,29 @@ def evaluate_code_capacity(
     llr_z = float(math.log((1.0 - pz_clamped) / pz_clamped))
     llr_x = float(math.log((1.0 - px_clamped) / px_clamped))
 
-    print(f"Noise: p={p}, eta={eta}, pz={pz:.6f}, px={px:.6f}")
-    print(f"LLR_z={llr_z:.4f}, LLR_x={llr_x:.4f}")
+    # Per-shot LLRs for drifting noise (uses p_values when available)
+    has_per_shot_p = "p_values" in npz_data
+    if has_per_shot_p:
+        p_vals = npz_data["p_values"].astype(np.float64)
+        p_vals = np.clip(p_vals, 1e-7, 1.0 - 1e-7)
+        pz_vals = p_vals * eta / (eta + 1)
+        px_vals = p_vals / (eta + 1)
+        pz_vals = np.clip(pz_vals, 1e-7, 1.0 - 1e-7)
+        px_vals = np.clip(px_vals, 1e-7, 1.0 - 1e-7)
+        llr_z_per_shot = np.log((1.0 - pz_vals) / pz_vals).astype(np.float32)  # (shots,)
+        llr_x_per_shot = np.log((1.0 - px_vals) / px_vals).astype(np.float32)  # (shots,)
+        print(f"Noise: p_base={p}, eta={eta}, per-shot p range=[{p_vals.min():.4f}, {p_vals.max():.4f}]")
+        print(f"Per-shot LLR_z range=[{llr_z_per_shot.min():.4f}, {llr_z_per_shot.max():.4f}]")
+        print(f"Per-shot LLR_x range=[{llr_x_per_shot.min():.4f}, {llr_x_per_shot.max():.4f}]")
+    else:
+        llr_z_per_shot = None
+        llr_x_per_shot = None
+        print(f"Noise: p={p}, eta={eta}, pz={pz:.6f}, px={px:.6f}")
+        print(f"LLR_z={llr_z:.4f}, LLR_x={llr_x:.4f}")
+
+    # Stale LLR from base p (what a non-adaptive decoder would use)
+    llr_z_stale = llr_z
+    llr_x_stale = llr_x
 
     # Compute number of detector rounds
     if total_checks > 0 and num_detectors >= total_checks:
@@ -357,8 +382,8 @@ def evaluate_code_capacity(
     all_x_syn = collapsed[:, :mx]   # (shots, mx)
     all_z_syn = collapsed[:, mx:]   # (shots, mz)
 
-    # ---------- Batched BP decoding ----------
-    print("\nBatched BP decoding...")
+    # ---------- Batched BP decoding (stale LLR — doesn't know about drift) ----------
+    print("\nBatched BP decoding (stale LLR)...")
     t_start = time.time()
 
     dec_z_pre = MinSumBPDecoder(hx, max_iter=100, alpha=0.8, clamp_llr=20.0).to(device)
@@ -376,8 +401,8 @@ def evaluate_code_capacity(
         z_syn_t = torch.from_numpy(all_z_syn[start:end]).float().to(device)
         B_chunk = end - start
 
-        llr_z_t = torch.full((B_chunk, n), llr_z, dtype=torch.float32, device=device)
-        llr_x_t = torch.full((B_chunk, n), llr_x, dtype=torch.float32, device=device)
+        llr_z_t = torch.full((B_chunk, n), llr_z_stale, dtype=torch.float32, device=device)
+        llr_x_t = torch.full((B_chunk, n), llr_x_stale, dtype=torch.float32, device=device)
 
         with torch.no_grad():
             _, hard_z, conv_z = dec_z_pre(x_syn_t, llr_z_t)
@@ -402,11 +427,57 @@ def evaluate_code_capacity(
     bp_elapsed = time.time() - t_start
     print(f"  BP done: {shots / bp_elapsed:.0f} shots/s")
 
+    # ---------- Oracle BP (true per-shot LLR — upper bound) ----------
+    oracle_bp_errors = 0
+    oracle_bp_converged = 0
+    if has_per_shot_p:
+        print("\nBatched Oracle BP decoding (true per-shot LLR)...")
+        t_oracle = time.time()
+
+        oracle_hard_z_all = []
+        oracle_hard_x_all = []
+        oracle_conv_all = []
+
+        for start in range(0, shots, CHUNK):
+            end = min(start + CHUNK, shots)
+            x_syn_t = torch.from_numpy(all_x_syn[start:end]).float().to(device)
+            z_syn_t = torch.from_numpy(all_z_syn[start:end]).float().to(device)
+            B_chunk = end - start
+
+            # Per-shot LLRs: broadcast (B,) -> (B, n)
+            llr_z_t = torch.from_numpy(
+                np.broadcast_to(llr_z_per_shot[start:end, None], (B_chunk, n)).copy()
+            ).float().to(device)
+            llr_x_t = torch.from_numpy(
+                np.broadcast_to(llr_x_per_shot[start:end, None], (B_chunk, n)).copy()
+            ).float().to(device)
+
+            with torch.no_grad():
+                _, hard_z, conv_z = dec_z_pre(x_syn_t, llr_z_t)
+                _, hard_x, conv_x = dec_x_pre(z_syn_t, llr_x_t)
+
+            oracle_hard_z_all.append(hard_z.cpu().numpy())
+            oracle_hard_x_all.append(hard_x.cpu().numpy())
+            oracle_conv_all.append((conv_z & conv_x).cpu().numpy())
+
+            if end % max(1, shots // 5) < CHUNK:
+                elapsed = time.time() - t_oracle
+                print(f"  Oracle BP: {end}/{shots} shots ({end / elapsed:.0f} shots/s)")
+
+        oracle_z_errors = np.concatenate(oracle_hard_z_all, axis=0)
+        oracle_x_errors = np.concatenate(oracle_hard_x_all, axis=0)
+        oracle_conv = np.concatenate(oracle_conv_all, axis=0)
+
+        oracle_logical = _check_logical_errors_batch(oracle_z_errors, oracle_x_errors, lx, lz, observables)
+        oracle_bp_errors = int(oracle_logical.sum())
+        oracle_bp_converged = int(oracle_conv.sum())
+        print(f"  Oracle BP done: {shots / (time.time() - t_oracle):.0f} shots/s")
+
     # ---------- Batched GNN-BP decoding ----------
     gnn_bp_errors = 0
     gnn_bp_converged = 0
     if gnn_model is not None:
-        print("Batched GNN-BP decoding...")
+        print("\nBatched GNN-BP decoding (stale LLR + GNN correction)...")
         t_gnn = time.time()
 
         # GNN runs per-shot (graph-level), but BP is batched after corrections
@@ -424,14 +495,14 @@ def evaluate_code_capacity(
             end = min(start + CHUNK, shots)
             B_chunk = end - start
 
-            # Build per-shot GNN corrections
+            # Build per-shot GNN corrections (GNN sees stale LLR + syndrome)
             corrections_z = np.zeros((B_chunk, n), dtype=np.float32)
             corrections_x = np.zeros((B_chunk, n), dtype=np.float32)
 
             for i in range(B_chunk):
                 si = start + i
                 x_feat = torch.zeros(num_nodes, 4, dtype=torch.float32)
-                avg_llr = (llr_z + llr_x) / 2.0
+                avg_llr = (llr_z_stale + llr_x_stale) / 2.0
                 x_feat[:n, 0] = avg_llr
                 x_feat[:n, 1] = 1.0
                 x_feat[n:n+mx, 0] = torch.from_numpy(all_x_syn[si]).float()
@@ -451,8 +522,8 @@ def evaluate_code_capacity(
                     gnn_model.eval()
                     gnn_out = gnn_model(data_obj)
 
-                llr_z_s = torch.full((n,), llr_z, dtype=torch.float32, device=device)
-                llr_x_s = torch.full((n,), llr_x, dtype=torch.float32, device=device)
+                llr_z_s = torch.full((n,), llr_z_stale, dtype=torch.float32, device=device)
+                llr_x_s = torch.full((n,), llr_x_stale, dtype=torch.float32, device=device)
 
                 if correction_mode == "both":
                     add_c, mul_c = gnn_out
@@ -559,6 +630,157 @@ def evaluate_code_capacity(
         mwpm_errors = sum(results_mwpm)
         print(f"  MWPM done: {shots / (time.time() - t_mwpm):.0f} shots/s ({n_workers} workers)")
 
+    # ---------- BP-LSD (parallel with threads) ----------
+    bplsd_errors = 0
+    bplsd_available = False
+    if use_bplsd:
+        try:
+            from gnn_pipeline.bplsd_decoder import run_css_bplsd_decoder
+            bplsd_available = True
+        except ImportError as e:
+            print(f"Warning: BP-LSD not available: {e}")
+
+    if bplsd_available:
+        import concurrent.futures
+        import os
+
+        print(f"BP-LSD decoding (parallel, method={lsd_method}, order={lsd_order})...")
+        t_bplsd = time.time()
+        n_workers = max(1, os.cpu_count() - 1)
+
+        def _bplsd_shot(idx):
+            z_e, x_e = run_css_bplsd_decoder(
+                all_x_syn[idx], all_z_syn[idx], hx, hz,
+                error_rate_z=pz, error_rate_x=px,
+                lsd_order=lsd_order, lsd_method=lsd_method,
+            )
+            return _check_logical_error(z_e, x_e, lx, lz, observables[idx])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results_bplsd = list(pool.map(_bplsd_shot, range(shots)))
+
+        bplsd_errors = sum(results_bplsd)
+        print(f"  BP-LSD done: {shots / (time.time() - t_bplsd):.0f} shots/s ({n_workers} workers)")
+
+    # ---------- BeliefFind (parallel with threads) ----------
+    bf_errors = 0
+    bf_available = False
+    if use_belieffind:
+        try:
+            from gnn_pipeline.bplsd_decoder import run_css_belief_find_decoder
+            bf_available = True
+        except ImportError as e:
+            print(f"Warning: BeliefFind not available: {e}")
+
+    if bf_available:
+        import concurrent.futures
+        import os
+
+        print("BeliefFind decoding (parallel)...")
+        t_bf = time.time()
+        n_workers = max(1, os.cpu_count() - 1)
+
+        def _bf_shot(idx):
+            z_e, x_e = run_css_belief_find_decoder(
+                all_x_syn[idx], all_z_syn[idx], hx, hz,
+                error_rate_z=pz, error_rate_x=px,
+            )
+            return _check_logical_error(z_e, x_e, lx, lz, observables[idx])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results_bf = list(pool.map(_bf_shot, range(shots)))
+
+        bf_errors = sum(results_bf)
+        print(f"  BeliefFind done: {shots / (time.time() - t_bf):.0f} shots/s ({n_workers} workers)")
+
+    # ---------- GNN + BP-LSD (the novel combination) ----------
+    gnn_bplsd_errors = 0
+    gnn_bplsd_available = False
+    if gnn_model is not None and use_bplsd:
+        try:
+            from gnn_pipeline.bplsd_decoder import run_css_bplsd_with_llr
+            gnn_bplsd_available = True
+        except ImportError:
+            pass
+
+    if gnn_bplsd_available:
+        import concurrent.futures
+        import os
+
+        print("GNN + BP-LSD decoding (GNN corrections -> BP-LSD post-process)...")
+        t_gnn_lsd = time.time()
+        n_workers = max(1, os.cpu_count() - 1)
+
+        # First compute GNN corrections for all shots (reuse from GNN-BP if available)
+        node_type_np2, edge_index_np2, edge_type_np2 = build_tanner_graph(hx, hz)
+        node_type_t2 = torch.from_numpy(node_type_np2).long().to(device)
+        edge_index_t2 = torch.from_numpy(edge_index_np2).long().to(device)
+        edge_type_t2 = torch.from_numpy(edge_type_np2).long().to(device)
+        num_nodes2 = n + mx + mz
+
+        # Collect per-shot corrected LLRs
+        all_corr_llr_z = np.zeros((shots, n), dtype=np.float32)
+        all_corr_llr_x = np.zeros((shots, n), dtype=np.float32)
+
+        for si in range(shots):
+            x_feat = torch.zeros(num_nodes2, 4, dtype=torch.float32)
+            avg_llr = (llr_z_stale + llr_x_stale) / 2.0
+            x_feat[:n, 0] = avg_llr
+            x_feat[:n, 1] = 1.0
+            x_feat[n:n+mx, 0] = torch.from_numpy(all_x_syn[si]).float()
+            x_feat[n:n+mx, 2] = 1.0
+            x_feat[n+mx:, 0] = torch.from_numpy(all_z_syn[si]).float()
+            x_feat[n+mx:, 3] = 1.0
+
+            data_obj = Data(
+                x=x_feat.to(device),
+                edge_index=edge_index_t2,
+                edge_type=edge_type_t2,
+                node_type=node_type_t2,
+                channel_llr=torch.full((n,), avg_llr, dtype=torch.float32, device=device),
+            )
+
+            with torch.no_grad():
+                gnn_model.eval()
+                gnn_out = gnn_model(data_obj)
+
+            llr_z_s = torch.full((n,), llr_z_stale, dtype=torch.float32, device=device)
+            llr_x_s = torch.full((n,), llr_x_stale, dtype=torch.float32, device=device)
+
+            if correction_mode == "both":
+                add_c, mul_c = gnn_out
+                add_c = torch.clamp(add_c, -20.0, 20.0)
+                mul_c = torch.clamp(mul_c, -5.0, 5.0)
+                gnn_out = (add_c, mul_c)
+            else:
+                gnn_out = torch.clamp(gnn_out, -20.0, 20.0)
+
+            all_corr_llr_z[si] = apply_correction(llr_z_s, gnn_out, correction_mode).cpu().numpy()
+            all_corr_llr_x[si] = apply_correction(llr_x_s, gnn_out, correction_mode).cpu().numpy()
+
+            if (si + 1) % max(1, shots // 5) == 0:
+                elapsed_gnn = time.time() - t_gnn_lsd
+                print(f"  GNN corrections: {si+1}/{shots} ({(si+1)/elapsed_gnn:.0f} shots/s)")
+
+        # Now run BP-LSD with per-qubit corrected LLRs (parallel)
+        print("  Running BP-LSD with GNN-corrected LLRs...")
+        t_lsd_part = time.time()
+
+        def _gnn_bplsd_shot(idx):
+            z_e, x_e = run_css_bplsd_with_llr(
+                all_x_syn[idx], all_z_syn[idx], hx, hz,
+                per_qubit_llr_z=all_corr_llr_z[idx],
+                per_qubit_llr_x=all_corr_llr_x[idx],
+                lsd_order=lsd_order, lsd_method=lsd_method,
+            )
+            return _check_logical_error(z_e, x_e, lx, lz, observables[idx])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results_gnn_bplsd = list(pool.map(_gnn_bplsd_shot, range(shots)))
+
+        gnn_bplsd_errors = sum(results_gnn_bplsd)
+        print(f"  GNN+BP-LSD done: {shots / (time.time() - t_gnn_lsd):.0f} shots/s total")
+
     elapsed = time.time() - t_start
 
     # ---------- Report results ----------
@@ -566,7 +788,7 @@ def evaluate_code_capacity(
     bp_ler_low, bp_ler_high = wilson_score_interval_binom(bp_errors, shots)
 
     print(f"\n=== Results ({elapsed:.1f}s) ===")
-    print(f"BP Decoder (separate CSS, batched):")
+    print(f"BP Decoder (stale LLR, separate CSS, batched):")
     print(f"  Logical Error Rate: {bp_ler:.6f}")
     print(f"  95% CI: [{bp_ler_low:.6f}, {bp_ler_high:.6f}]")
     print(f"  Errors: {bp_errors}/{shots}")
@@ -576,6 +798,7 @@ def evaluate_code_capacity(
         "mode": "code_capacity",
         "code": {"n": int(n), "mx": int(mx), "mz": int(mz)},
         "noise": {"p": p, "eta": eta, "pz": pz, "px": px},
+        "has_per_shot_p": has_per_shot_p,
         "test_shots": shots,
         "elapsed_seconds": round(elapsed, 1),
         "bp": {
@@ -586,6 +809,27 @@ def evaluate_code_capacity(
             "convergence_rate": float(bp_converged / shots),
         },
     }
+
+    if has_per_shot_p:
+        oracle_ler = oracle_bp_errors / shots if shots > 0 else 0.0
+        oracle_ler_low, oracle_ler_high = wilson_score_interval_binom(oracle_bp_errors, shots)
+
+        print(f"\nOracle BP (true per-shot LLR, upper bound):")
+        print(f"  Logical Error Rate: {oracle_ler:.6f}")
+        print(f"  95% CI: [{oracle_ler_low:.6f}, {oracle_ler_high:.6f}]")
+        print(f"  Errors: {oracle_bp_errors}/{shots}")
+        print(f"  Convergence: {oracle_bp_converged}/{shots} ({100*oracle_bp_converged/shots:.1f}%)")
+
+        oracle_improv = (bp_ler - oracle_ler) / bp_ler if bp_ler > 0 else 0.0
+        print(f"  Improvement over stale BP: {100*oracle_improv:.1f}%")
+
+        results["oracle_bp"] = {
+            "errors": int(oracle_bp_errors),
+            "ler": float(oracle_ler),
+            "ler_ci_low": float(oracle_ler_low),
+            "ler_ci_high": float(oracle_ler_high),
+            "convergence_rate": float(oracle_bp_converged / shots),
+        }
 
     if gnn_model is not None:
         gnn_bp_ler = gnn_bp_errors / shots if shots > 0 else 0.0
@@ -598,7 +842,7 @@ def evaluate_code_capacity(
         print(f"  Convergence: {gnn_bp_converged}/{shots} ({100*gnn_bp_converged/shots:.1f}%)")
 
         improvement = (bp_ler - gnn_bp_ler) / bp_ler if bp_ler > 0 else 0.0
-        print(f"\n  Improvement over BP: {100*improvement:.1f}%")
+        print(f"  Improvement over stale BP: {100*improvement:.1f}%")
 
         results["gnn_bp"] = {
             "errors": int(gnn_bp_errors),
@@ -646,6 +890,98 @@ def evaluate_code_capacity(
             "ler_ci_low": float(mwpm_ler_low),
             "ler_ci_high": float(mwpm_ler_high),
         }
+
+    if bplsd_available:
+        bplsd_ler = bplsd_errors / shots if shots > 0 else 0.0
+        bplsd_ler_low, bplsd_ler_high = wilson_score_interval_binom(bplsd_errors, shots)
+
+        print(f"\nBP-LSD Decoder ({lsd_method}, order={lsd_order}):")
+        print(f"  Logical Error Rate: {bplsd_ler:.6f}")
+        print(f"  95% CI: [{bplsd_ler_low:.6f}, {bplsd_ler_high:.6f}]")
+        print(f"  Errors: {bplsd_errors}/{shots}")
+
+        bp_vs_bplsd = (bp_ler - bplsd_ler) / bp_ler if bp_ler > 0 else 0.0
+        print(f"  Improvement over BP: {100*bp_vs_bplsd:.1f}%")
+
+        results["bplsd"] = {
+            "errors": int(bplsd_errors),
+            "ler": float(bplsd_ler),
+            "ler_ci_low": float(bplsd_ler_low),
+            "ler_ci_high": float(bplsd_ler_high),
+        }
+
+    if bf_available:
+        bf_ler = bf_errors / shots if shots > 0 else 0.0
+        bf_ler_low, bf_ler_high = wilson_score_interval_binom(bf_errors, shots)
+
+        print(f"\nBeliefFind Decoder (BP + Union Find):")
+        print(f"  Logical Error Rate: {bf_ler:.6f}")
+        print(f"  95% CI: [{bf_ler_low:.6f}, {bf_ler_high:.6f}]")
+        print(f"  Errors: {bf_errors}/{shots}")
+
+        bp_vs_bf = (bp_ler - bf_ler) / bp_ler if bp_ler > 0 else 0.0
+        print(f"  Improvement over BP: {100*bp_vs_bf:.1f}%")
+
+        results["belieffind"] = {
+            "errors": int(bf_errors),
+            "ler": float(bf_ler),
+            "ler_ci_low": float(bf_ler_low),
+            "ler_ci_high": float(bf_ler_high),
+        }
+
+    if gnn_bplsd_available:
+        gnn_bplsd_ler = gnn_bplsd_errors / shots if shots > 0 else 0.0
+        gnn_bplsd_ler_low, gnn_bplsd_ler_high = wilson_score_interval_binom(gnn_bplsd_errors, shots)
+
+        print(f"\nGNN + BP-LSD Decoder (GNN-corrected LLRs -> BP-LSD):")
+        print(f"  Logical Error Rate: {gnn_bplsd_ler:.6f}")
+        print(f"  95% CI: [{gnn_bplsd_ler_low:.6f}, {gnn_bplsd_ler_high:.6f}]")
+        print(f"  Errors: {gnn_bplsd_errors}/{shots}")
+
+        bp_vs_gnn_bplsd = (bp_ler - gnn_bplsd_ler) / bp_ler if bp_ler > 0 else 0.0
+        print(f"  Improvement over BP: {100*bp_vs_gnn_bplsd:.1f}%")
+
+        if bplsd_available:
+            lsd_vs_gnn_lsd = (bplsd_ler - gnn_bplsd_ler) / bplsd_ler if bplsd_ler > 0 else 0.0
+            print(f"  Improvement over plain BP-LSD: {100*lsd_vs_gnn_lsd:.1f}%")
+
+        results["gnn_bplsd"] = {
+            "errors": int(gnn_bplsd_errors),
+            "ler": float(gnn_bplsd_ler),
+            "ler_ci_low": float(gnn_bplsd_ler_low),
+            "ler_ci_high": float(gnn_bplsd_ler_high),
+        }
+
+    # ---------- Sorted Comparison Table ----------
+    decoder_table = []
+    decoder_table.append(("BP (stale LLR)", bp_ler))
+    if has_per_shot_p:
+        oracle_ler_val = oracle_bp_errors / shots if shots > 0 else 0.0
+        decoder_table.append(("Oracle BP", oracle_ler_val))
+    if gnn_model is not None:
+        gnn_bp_ler_val = gnn_bp_errors / shots if shots > 0 else 0.0
+        decoder_table.append(("GNN-BP", gnn_bp_ler_val))
+    if bposd_available:
+        decoder_table.append(("BP-OSD", bposd_ler))
+    if bplsd_available:
+        decoder_table.append(("BP-LSD", bplsd_ler))
+    if bf_available:
+        decoder_table.append(("BeliefFind", bf_ler))
+    if gnn_bplsd_available:
+        decoder_table.append(("GNN + BP-LSD", gnn_bplsd_ler))
+    if mwpm_available:
+        decoder_table.append(("MWPM", mwpm_ler))
+
+    decoder_table.sort(key=lambda x: x[1])
+
+    print(f"\n{'='*50}")
+    print(f"  Decoder Comparison (sorted by LER)")
+    print(f"{'='*50}")
+    for rank, (name, ler_val) in enumerate(decoder_table, 1):
+        improv = (bp_ler - ler_val) / bp_ler * 100 if bp_ler > 0 else 0.0
+        tag = " (best)" if rank == 1 else ""
+        print(f"  {rank}. {name:20s}  LER = {ler_val:.6f}  ({improv:+.1f}% vs BP){tag}")
+    print(f"{'='*50}")
 
     return results
 
@@ -824,6 +1160,15 @@ def main(argv: List[str] | None = None) -> int:
                         help="Enable BP-OSD baseline decoder")
     parser.add_argument("--mwpm", action="store_true",
                         help="Enable MWPM baseline decoder (approximate for LDPC codes)")
+    parser.add_argument("--bplsd", action="store_true",
+                        help="Enable BP-LSD decoder (stronger than BP-OSD for LDPC codes)")
+    parser.add_argument("--belieffind", action="store_true",
+                        help="Enable BeliefFind (BP + Union Find) decoder")
+    parser.add_argument("--lsd_order", type=int, default=0,
+                        help="LSD order for BP-LSD decoder (0=fastest, higher=stronger)")
+    parser.add_argument("--lsd_method", type=str, default="LSD_CS",
+                        choices=["LSD_0", "LSD_E", "LSD_CS"],
+                        help="LSD method for BP-LSD decoder")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out_dir", type=str, required=True,
                         help="Output directory for results")
@@ -857,11 +1202,15 @@ def main(argv: List[str] | None = None) -> int:
                     hidden_dim=checkpoint.get("hidden_dim", 64),
                     num_mp_layers=checkpoint.get("num_mp_layers", 3),
                     correction_mode=gnn_correction_mode,
+                    use_residual=checkpoint.get("use_residual", False),
+                    use_layer_norm=checkpoint.get("use_layer_norm", False),
+                    use_attention=checkpoint.get("use_attention", False),
                 )
                 gnn_model_inst.load_state_dict(checkpoint["model_state_dict"])
                 print(f"  Loaded checkpoint (hidden_dim={checkpoint.get('hidden_dim', 64)}, "
                       f"num_mp_layers={checkpoint.get('num_mp_layers', 3)}, "
-                      f"correction_mode={gnn_correction_mode})")
+                      f"correction_mode={gnn_correction_mode}, "
+                      f"attention={checkpoint.get('use_attention', False)})")
             else:
                 gnn_model_inst = TannerGNN()
                 gnn_model_inst.load_state_dict(checkpoint)
@@ -875,7 +1224,11 @@ def main(argv: List[str] | None = None) -> int:
             gnn_model=gnn_model_inst,
             use_bposd=args.bposd,
             use_mwpm=args.mwpm,
+            use_bplsd=args.bplsd,
+            use_belieffind=args.belieffind,
             correction_mode=gnn_correction_mode,
+            lsd_order=args.lsd_order,
+            lsd_method=args.lsd_method,
         )
     elif args.mode == "circuit_level":
         results = evaluate_circuit_level(

@@ -1,9 +1,6 @@
-"""GNN that outputs per-qubit LLR corrections for BP decoding.
+"""GNN models for QLDPC decoding.
 
-Architecture:
-  - Typed message passing on the heterogeneous Tanner graph
-  - GRU cell for node state updates across MP layers
-  - Final readout MLP on data-qubit nodes → scalar LLR correction per qubit
+TannerGNN outputs per-qubit LLR corrections for BP decoding.
 """
 from __future__ import annotations
 
@@ -38,7 +35,7 @@ def apply_correction(channel_llr: torch.Tensor, gnn_output, mode: str) -> torch.
 class TypedMessagePassingLayer(nn.Module):
     """Single message-passing layer with edge-type-specific transforms.
 
-    Supports optional residual connections and layer normalization.
+    Supports optional residual connections, layer normalization, and attention.
     """
 
     def __init__(
@@ -48,9 +45,11 @@ class TypedMessagePassingLayer(nn.Module):
         dropout: float = 0.1,
         use_residual: bool = False,
         use_layer_norm: bool = False,
+        use_attention: bool = False,
     ):
         super().__init__()
         self.use_residual = use_residual
+        self.use_attention = use_attention
         self.edge_mlps = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(2 * hidden_dim, hidden_dim),
@@ -62,6 +61,13 @@ class TypedMessagePassingLayer(nn.Module):
         ])
         self.gru = nn.GRUCell(hidden_dim, hidden_dim)
         self.layer_norm = nn.LayerNorm(hidden_dim) if use_layer_norm else None
+
+        # Attention: per-edge scalar score from src||dst embeddings
+        if use_attention:
+            self.attn_linears = nn.ModuleList([
+                nn.Linear(2 * hidden_dim, 1)
+                for _ in range(edge_types)
+            ])
 
     def forward(
         self,
@@ -92,6 +98,12 @@ class TypedMessagePassingLayer(nn.Module):
             dst_e = dst[mask]
             msg_input = torch.cat([x[src_e], x[dst_e]], dim=1)
             msgs = mlp(msg_input)
+
+            # Optional attention weighting
+            if self.use_attention:
+                attn_score = torch.sigmoid(self.attn_linears[etype](msg_input))  # (E_type, 1)
+                msgs = msgs * attn_score
+
             agg.scatter_add_(0, dst_e.unsqueeze(1).expand_as(msgs), msgs)
 
         # GRU update
@@ -127,6 +139,7 @@ class TannerGNN(nn.Module):
         correction_mode: str = "additive",
         use_residual: bool = False,
         use_layer_norm: bool = False,
+        use_attention: bool = False,
     ):
         super().__init__()
         self.node_feat_dim = node_feat_dim
@@ -134,6 +147,7 @@ class TannerGNN(nn.Module):
         self.correction_mode = correction_mode
         self.use_residual = use_residual
         self.use_layer_norm = use_layer_norm
+        self.use_attention = use_attention
 
         # Input projection with normalization for mixed-scale features
         # (LLR values ~20, indicator bits ~1)
@@ -150,6 +164,7 @@ class TannerGNN(nn.Module):
                 hidden_dim, edge_types, dropout,
                 use_residual=use_residual,
                 use_layer_norm=use_layer_norm,
+                use_attention=use_attention,
             )
             for _ in range(num_mp_layers)
         ])
