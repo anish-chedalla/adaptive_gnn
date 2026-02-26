@@ -41,7 +41,11 @@ from torch_geometric.loader import DataLoader
 from gnn_pipeline.bp_decoder import MinSumBPDecoder
 from gnn_pipeline.dataset import build_graph_dataset, _load_npz
 from gnn_pipeline.gnn_model import TannerGNN, apply_correction
-from gnn_pipeline.loss_functions import weighted_bce_loss, focal_loss, logical_aware_loss, syndrome_consistency_loss
+from gnn_pipeline.loss_functions import (
+    weighted_bce_loss, focal_loss, logical_aware_loss,
+    syndrome_consistency_loss, coset_loss, constraint_loss,
+)
+from gnn_pipeline.monitoring import TrainingMonitor
 
 
 def _compute_loss(
@@ -61,6 +65,8 @@ def _compute_loss(
     z_syndrome: torch.Tensor | None = None,
     hx_t: torch.Tensor | None = None,
     hz_t: torch.Tensor | None = None,
+    coset_syn_weight: float = 1.0,
+    coset_logical_weight: float = 1.0,
 ) -> torch.Tensor:
     """Compute loss on BP marginals vs ground-truth errors (shared by train/eval)."""
     if loss_fn == "mse":
@@ -84,6 +90,28 @@ def _compute_loss(
             marginals_z, marginals_x, z_error, x_error,
             lx_t, lz_t, base_loss_fn=F.binary_cross_entropy, logical_weight=logical_weight,
         )
+    elif loss_fn == "coset":
+        # Degeneracy-aware loss: only penalizes syndrome and logical observable mismatch
+        # Requires hx_t, hz_t, lx_t, lz_t, x_syndrome, z_syndrome
+        base = coset_loss(
+            marginals_z, z_error, x_syndrome, hx_t, lx_t,
+            syn_weight=coset_syn_weight, logical_weight=coset_logical_weight,
+        ) + coset_loss(
+            marginals_x, x_error, z_syndrome, hz_t, lz_t,
+            syn_weight=coset_syn_weight, logical_weight=coset_logical_weight,
+        )
+        # No additional syndrome consistency term needed — it's built into coset loss
+        return base
+    elif loss_fn == "constraint":
+        # Astra-style |sin(pi*x/2)| differentiable mod-2 loss
+        base = constraint_loss(
+            marginals_z, x_syndrome, hx_t, lx_t, z_error,
+            syn_weight=coset_syn_weight, logical_weight=coset_logical_weight,
+        ) + constraint_loss(
+            marginals_x, z_syndrome, hz_t, lz_t, x_error,
+            syn_weight=coset_syn_weight, logical_weight=coset_logical_weight,
+        )
+        return base
     else:
         raise ValueError(f"Unknown loss function: {loss_fn}")
 
@@ -122,6 +150,10 @@ def train_epoch(
     hx_t: torch.Tensor | None = None,
     hz_t: torch.Tensor | None = None,
     augment: bool = False,
+    coset_syn_weight: float = 1.0,
+    coset_logical_weight: float = 1.0,
+    interleaved: bool = False,
+    num_stages: int = 2,
 ) -> dict:
     """Train for one epoch on supervised loss through differentiable BP.
 
@@ -177,9 +209,33 @@ def train_epoch(
                 x_syndrome = torch.abs(x_syndrome - flip_mask_x)
                 z_syndrome = torch.abs(z_syndrome - flip_mask_z)
 
-            # Differentiable BP forward
-            marginals_z, hard_z, conv_z = dec_z(x_syndrome, corrected_llr_z)
-            marginals_x, hard_x, conv_x = dec_x(z_syndrome, corrected_llr_x)
+            # Differentiable BP forward (standard or interleaved)
+            if interleaved:
+                # Interleaved: BP runs in stages with LLR reset between stages.
+                # CTV messages carry over, but channel LLR is refreshed to
+                # the GNN-corrected value, preventing LLR drift.
+                bp_iters_total = dec_z.max_iter
+                stage_iters = max(1, bp_iters_total // num_stages)
+
+                def _reset_correction_fn_z(mid_marginals, current_llr, stage_idx):
+                    return corrected_llr_z
+
+                def _reset_correction_fn_x(mid_marginals, current_llr, stage_idx):
+                    return corrected_llr_x
+
+                marginals_z, hard_z, conv_z = dec_z.forward_stages(
+                    x_syndrome, corrected_llr_z,
+                    stage_iters=stage_iters, num_stages=num_stages,
+                    correction_fn=_reset_correction_fn_z,
+                )
+                marginals_x, hard_x, conv_x = dec_x.forward_stages(
+                    z_syndrome, corrected_llr_x,
+                    stage_iters=stage_iters, num_stages=num_stages,
+                    correction_fn=_reset_correction_fn_x,
+                )
+            else:
+                marginals_z, hard_z, conv_z = dec_z(x_syndrome, corrected_llr_z)
+                marginals_x, hard_x, conv_x = dec_x(z_syndrome, corrected_llr_x)
 
             # Loss on soft marginals vs ground-truth error vectors
             loss = _compute_loss(
@@ -189,6 +245,8 @@ def train_epoch(
                 syn_weight=syn_weight,
                 x_syndrome=x_syndrome, z_syndrome=z_syndrome,
                 hx_t=hx_t, hz_t=hz_t,
+                coset_syn_weight=coset_syn_weight,
+                coset_logical_weight=coset_logical_weight,
             )
 
         # Gradient accumulation with AMP support
@@ -203,12 +261,14 @@ def train_epoch(
             if scaler is not None:
                 if grad_clip > 0:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                    all_clip_params = list(model.parameters()) + list(dec_z.parameters()) + (list(dec_x.parameters()) if dec_x is not None else [])
+                    torch.nn.utils.clip_grad_norm_(all_clip_params, max_norm=grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                    all_clip_params = list(model.parameters()) + list(dec_z.parameters()) + (list(dec_x.parameters()) if dec_x is not None else [])
+                    torch.nn.utils.clip_grad_norm_(all_clip_params, max_norm=grad_clip)
                 optimizer.step()
             optimizer.zero_grad()
 
@@ -271,6 +331,10 @@ def eval_epoch(
     syn_weight: float = 0.0,
     hx_t: torch.Tensor | None = None,
     hz_t: torch.Tensor | None = None,
+    coset_syn_weight: float = 1.0,
+    coset_logical_weight: float = 1.0,
+    interleaved: bool = False,
+    num_stages: int = 2,
 ) -> dict:
     """Evaluate on validation/test set."""
     model.eval()
@@ -307,8 +371,29 @@ def eval_epoch(
         x_syndrome = target_syn[:, :mx]
         z_syndrome = target_syn[:, mx:]
 
-        marginals_z, hard_z, conv_z = dec_z(x_syndrome, corrected_llr_z)
-        marginals_x, hard_x, conv_x = dec_x(z_syndrome, corrected_llr_x)
+        if interleaved:
+            bp_iters_total = dec_z.max_iter
+            stage_iters = max(1, bp_iters_total // num_stages)
+
+            def _reset_fn_z(mid_m, cur_llr, stage):
+                return corrected_llr_z
+
+            def _reset_fn_x(mid_m, cur_llr, stage):
+                return corrected_llr_x
+
+            marginals_z, hard_z, conv_z = dec_z.forward_stages(
+                x_syndrome, corrected_llr_z,
+                stage_iters=stage_iters, num_stages=num_stages,
+                correction_fn=_reset_fn_z,
+            )
+            marginals_x, hard_x, conv_x = dec_x.forward_stages(
+                z_syndrome, corrected_llr_x,
+                stage_iters=stage_iters, num_stages=num_stages,
+                correction_fn=_reset_fn_x,
+            )
+        else:
+            marginals_z, hard_z, conv_z = dec_z(x_syndrome, corrected_llr_z)
+            marginals_x, hard_x, conv_x = dec_x(z_syndrome, corrected_llr_x)
 
         loss = _compute_loss(
             marginals_z, marginals_x, z_error, x_error,
@@ -317,6 +402,8 @@ def eval_epoch(
             syn_weight=syn_weight,
             x_syndrome=x_syndrome, z_syndrome=z_syndrome,
             hx_t=hx_t, hz_t=hz_t,
+            coset_syn_weight=coset_syn_weight,
+            coset_logical_weight=coset_logical_weight,
         )
 
         bit_acc_z = (hard_z == z_error.long()).float().mean().item()
@@ -361,7 +448,7 @@ def main(argv: List[str] | None = None) -> int:
     )
     parser.add_argument(
         "--loss", type=str, default="mse",
-        choices=["mse", "bce", "weighted_bce", "focal", "logical_mse", "logical_bce"],
+        choices=["mse", "bce", "weighted_bce", "focal", "logical_mse", "logical_bce", "coset", "constraint"],
         help="Loss function on BP marginals",
     )
     parser.add_argument("--pos_weight", type=float, default=0.0,
@@ -441,7 +528,7 @@ def main(argv: List[str] | None = None) -> int:
     )
     parser.add_argument(
         "--loss_phase2", type=str, default=None,
-        choices=["mse", "bce", "weighted_bce", "focal", "logical_mse", "logical_bce"],
+        choices=["mse", "bce", "weighted_bce", "focal", "logical_mse", "logical_bce", "coset"],
         help="Switch to this loss after --phase2_epoch (default: disabled)",
     )
     parser.add_argument(
@@ -455,6 +542,34 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument(
         "--learnable_alpha", action="store_true",
         help="Make BP damping factor (alpha) a learnable parameter, jointly optimized with GNN",
+    )
+    parser.add_argument(
+        "--neural_bp", action="store_true",
+        help="Enable Neural BP: per-iteration learned weights inside BP loop",
+    )
+    parser.add_argument(
+        "--use_film", action="store_true",
+        help="Enable FiLM conditioning: noise-adaptive GNN via per-shot p_value",
+    )
+    parser.add_argument(
+        "--noise_feat_dim", type=int, default=1,
+        help="Dimension of noise features for FiLM conditioning (default: 1 = p_value only)",
+    )
+    parser.add_argument(
+        "--coset_syn_weight", type=float, default=1.0,
+        help="Weight for syndrome component in coset loss (default: 1.0)",
+    )
+    parser.add_argument(
+        "--coset_logical_weight", type=float, default=1.0,
+        help="Weight for logical observable component in coset loss (default: 1.0)",
+    )
+    parser.add_argument(
+        "--interleaved", action="store_true",
+        help="Use interleaved GNN-BP: split BP into stages with LLR refresh between stages",
+    )
+    parser.add_argument(
+        "--num_stages", type=int, default=2,
+        help="Number of interleaved BP stages (default: 2, total iters = bp_iters)",
     )
     parser.add_argument(
         "--out_dir", type=str, required=True,
@@ -498,15 +613,16 @@ def main(argv: List[str] | None = None) -> int:
     mz = int(hz.shape[0])
     print(f"Code: n={n_qubits}, mx={mx}, mz={mz}")
 
-    # Load logical operators (needed for logical_* losses)
+    # Load logical operators (needed for logical_* and coset losses)
     lx_t, lz_t = None, None
-    if args.loss.startswith("logical_"):
+    needs_logicals = args.loss.startswith("logical_") or args.loss in ("coset", "constraint")
+    if needs_logicals:
         if "lx" in first_npz and "lz" in first_npz:
             lx_t = torch.tensor(first_npz["lx"].astype(np.float32))
             lz_t = torch.tensor(first_npz["lz"].astype(np.float32))
             print(f"Loaded logical operators: lx={lx_t.shape}, lz={lz_t.shape}")
         else:
-            print("ERROR: logical_* loss requires lx/lz in NPZ", file=sys.stderr)
+            print("ERROR: logical_*/coset loss requires lx/lz in NPZ", file=sys.stderr)
             return 1
 
     # Auto-compute pos_weight from data if not specified
@@ -525,12 +641,15 @@ def main(argv: List[str] | None = None) -> int:
     elif args.pos_weight <= 0:
         args.pos_weight = 50.0  # fallback
 
-    # PCM tensors for syndrome consistency loss
+    # PCM tensors for syndrome consistency loss or coset loss
     hx_t, hz_t = None, None
-    if args.syn_weight > 0:
+    if args.syn_weight > 0 or args.loss in ("coset", "constraint"):
         hx_t = torch.from_numpy(hx.astype(np.float32))
         hz_t = torch.from_numpy(hz.astype(np.float32))
-        print(f"Syndrome consistency loss enabled (weight={args.syn_weight})")
+        if args.loss == "coset":
+            print(f"Coset loss enabled (syn_weight={args.coset_syn_weight}, logical_weight={args.coset_logical_weight})")
+        if args.syn_weight > 0:
+            print(f"Syndrome consistency loss enabled (weight={args.syn_weight})")
 
     # Create dataloaders
     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
@@ -551,18 +670,42 @@ def main(argv: List[str] | None = None) -> int:
         hz_t = hz_t.to(device)
 
     # Build BP decoders ONCE (expensive constructors)
-    print(f"Building BP decoders (bp_iters={args.bp_iters})...")
+    neural_bp = args.neural_bp
+    print(f"Building BP decoders (bp_iters={args.bp_iters}, neural_bp={neural_bp})...")
     dec_z = MinSumBPDecoder(
-        hx.astype(np.uint8), max_iter=args.bp_iters, alpha=0.8, clamp_llr=20.0
+        hx.astype(np.uint8), max_iter=args.bp_iters, alpha=0.8, clamp_llr=20.0,
+        neural_bp=neural_bp,
     ).to(device)
     dec_x = MinSumBPDecoder(
-        hz.astype(np.uint8), max_iter=args.bp_iters, alpha=0.8, clamp_llr=20.0
+        hz.astype(np.uint8), max_iter=args.bp_iters, alpha=0.8, clamp_llr=20.0,
+        neural_bp=neural_bp,
     ).to(device)
-    # Freeze BP decoder buffers (they have no learnable params by default)
-    for p in dec_z.parameters():
-        p.requires_grad = False
-    for p in dec_x.parameters():
-        p.requires_grad = False
+
+    # Collect Neural BP learnable params (if enabled)
+    bp_params = []
+    if neural_bp:
+        # Neural BP weights are learnable — don't freeze them
+        bp_params.extend(list(dec_z.w_ch.parameters()))
+        bp_params.extend(list(dec_z.w_vtc.parameters()))
+        bp_params.extend(list(dec_z.w_ctv.parameters()))
+        bp_params.extend(list(dec_x.w_ch.parameters()))
+        bp_params.extend(list(dec_x.w_vtc.parameters()))
+        bp_params.extend(list(dec_x.w_ctv.parameters()))
+        n_bp_params = sum(p.numel() for p in bp_params)
+        print(f"  Neural BP: {n_bp_params} learnable weights ({args.bp_iters} iters x 3 per decoder x 2 decoders)")
+        # Freeze non-learnable BP buffers (the fixed edge structure etc.)
+        for p in dec_z.parameters():
+            if p not in set(bp_params):
+                p.requires_grad = False
+        for p in dec_x.parameters():
+            if p not in set(bp_params):
+                p.requires_grad = False
+    else:
+        # Freeze all BP decoder parameters (they have no learnable params by default)
+        for p in dec_z.parameters():
+            p.requires_grad = False
+        for p in dec_x.parameters():
+            p.requires_grad = False
 
     # Learnable alpha: make BP damping factor a trainable parameter
     alpha_params = []
@@ -583,7 +726,11 @@ def main(argv: List[str] | None = None) -> int:
         use_residual=args.use_residual,
         use_layer_norm=args.use_layer_norm,
         use_attention=args.use_attention,
+        use_film=args.use_film,
+        noise_feat_dim=args.noise_feat_dim,
     )
+    if args.use_film:
+        print(f"  FiLM conditioning enabled (noise_feat_dim={args.noise_feat_dim})")
 
     if args.pretrained and not args.from_scratch:
         print(f"Loading pretrained model from {args.pretrained}")
@@ -601,7 +748,7 @@ def main(argv: List[str] | None = None) -> int:
     print(f"Model: {n_params:,} trainable parameters")
 
     # Optimizer and scheduler
-    all_params = list(model.parameters()) + alpha_params
+    all_params = list(model.parameters()) + alpha_params + bp_params
     if args.weight_decay > 0:
         optimizer = AdamW(all_params, lr=args.lr, weight_decay=args.weight_decay)
     else:
@@ -689,11 +836,14 @@ def main(argv: List[str] | None = None) -> int:
         extra_info += f", phase2={args.loss_phase2}@epoch{args.phase2_epoch}"
     if args.augment:
         extra_info += ", augment"
+    if args.interleaved:
+        extra_info += f", interleaved({args.num_stages} stages)"
     print(f"\nTraining for {args.epochs} epochs (loss={args.loss}, bp_iters={args.bp_iters}{patience_str}{extra_info})...")
     print("-" * 90)
     best_val_loss = float("inf")
     patience_counter = 0
     history = []
+    monitor = TrainingMonitor(out_dir)
     t_start = time.time()
     early_stopped = False
     epochs_completed = 0
@@ -731,6 +881,10 @@ def main(argv: List[str] | None = None) -> int:
             scaler=scaler, use_amp=use_amp,
             syn_weight=args.syn_weight, hx_t=hx_t, hz_t=hz_t,
             augment=args.augment,
+            coset_syn_weight=args.coset_syn_weight,
+            coset_logical_weight=args.coset_logical_weight,
+            interleaved=args.interleaved,
+            num_stages=args.num_stages,
         )
         val_metrics = eval_epoch(
             model, val_loader, device,
@@ -743,6 +897,10 @@ def main(argv: List[str] | None = None) -> int:
             lx_t=lx_t, lz_t=lz_t,
             correction_mode=args.correction_mode,
             syn_weight=args.syn_weight, hx_t=hx_t, hz_t=hz_t,
+            coset_syn_weight=args.coset_syn_weight,
+            coset_logical_weight=args.coset_logical_weight,
+            interleaved=args.interleaved,
+            num_stages=args.num_stages,
         )
 
         if scheduler is not None:
@@ -776,13 +934,26 @@ def main(argv: List[str] | None = None) -> int:
         }
         history.append(epoch_record)
 
+        # CSV-compatible flat metrics for monitor
+        monitor.log_epoch(epoch + 1, {
+            "train_loss": train_metrics["loss"],
+            "val_loss": val_metrics["loss"],
+            "bit_acc_z": val_metrics.get("bit_acc_z", 0.0),
+            "bit_acc_x": val_metrics.get("bit_acc_x", 0.0),
+            "conv_z": val_metrics.get("convergence_z", 0.0),
+            "conv_x": val_metrics.get("convergence_x", 0.0),
+            "lr": lr_now,
+            "time_s": elapsed,
+        })
+        monitor.flush_csv()
+
         # Save best model
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
             patience_counter = 0
 
             # Save best_model.pt with architecture info for evaluate.py
-            torch.save({
+            best_model_dict = {
                 "model_state_dict": model.state_dict(),
                 "hidden_dim": args.hidden_dim,
                 "num_mp_layers": args.num_mp_layers,
@@ -790,7 +961,15 @@ def main(argv: List[str] | None = None) -> int:
                 "use_residual": args.use_residual,
                 "use_layer_norm": args.use_layer_norm,
                 "use_attention": args.use_attention,
-            }, str(out_dir / "best_model.pt"))
+                "use_film": args.use_film,
+                "noise_feat_dim": args.noise_feat_dim,
+                "neural_bp": neural_bp,
+                "bp_iters": args.bp_iters,
+            }
+            if neural_bp:
+                best_model_dict["dec_z_state_dict"] = dec_z.state_dict()
+                best_model_dict["dec_x_state_dict"] = dec_x.state_dict()
+            torch.save(best_model_dict, str(out_dir / "best_model.pt"))
 
             # Rich checkpoint with architecture info + optimizer state
             ckpt = {
@@ -803,11 +982,17 @@ def main(argv: List[str] | None = None) -> int:
                 "use_residual": args.use_residual,
                 "use_layer_norm": args.use_layer_norm,
                 "use_attention": args.use_attention,
+                "use_film": args.use_film,
+                "noise_feat_dim": args.noise_feat_dim,
+                "neural_bp": neural_bp,
                 "bp_iters": args.bp_iters,
                 "loss_fn": args.loss,
                 "epoch": epoch + 1,
                 "val_loss": best_val_loss,
             }
+            if neural_bp:
+                ckpt["dec_z_state_dict"] = dec_z.state_dict()
+                ckpt["dec_x_state_dict"] = dec_x.state_dict()
             if scheduler is not None:
                 ckpt["scheduler_state_dict"] = scheduler.state_dict()
             if scaler is not None:
@@ -833,7 +1018,7 @@ def main(argv: List[str] | None = None) -> int:
     print(f"Best validation loss: {best_val_loss:.6f}")
 
     # Save final model (with architecture info)
-    torch.save({
+    final_dict = {
         "model_state_dict": model.state_dict(),
         "hidden_dim": args.hidden_dim,
         "num_mp_layers": args.num_mp_layers,
@@ -841,18 +1026,17 @@ def main(argv: List[str] | None = None) -> int:
         "use_residual": args.use_residual,
         "use_layer_norm": args.use_layer_norm,
         "use_attention": args.use_attention,
+        "use_film": args.use_film,
+        "noise_feat_dim": args.noise_feat_dim,
+        "neural_bp": neural_bp,
+        "bp_iters": args.bp_iters,
         "epoch": epochs_completed,
-    }, str(out_dir / "final_model.pt"))
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "hidden_dim": args.hidden_dim,
-        "num_mp_layers": args.num_mp_layers,
-        "correction_mode": args.correction_mode,
-        "use_residual": args.use_residual,
-        "use_layer_norm": args.use_layer_norm,
-        "use_attention": args.use_attention,
-        "epoch": epochs_completed,
-    }, str(out_dir / "final_checkpoint.pt"))
+    }
+    if neural_bp:
+        final_dict["dec_z_state_dict"] = dec_z.state_dict()
+        final_dict["dec_x_state_dict"] = dec_x.state_dict()
+    torch.save(final_dict, str(out_dir / "final_model.pt"))
+    torch.save(final_dict, str(out_dir / "final_checkpoint.pt"))
 
     # Test-set evaluation on best model
     test_metrics = None
@@ -862,10 +1046,12 @@ def main(argv: List[str] | None = None) -> int:
         if best_ckpt_path.exists():
             best_ckpt = torch.load(str(best_ckpt_path), map_location=device, weights_only=True)
             model.load_state_dict(best_ckpt["model_state_dict"])
+        # Use the active loss function (accounts for phase2 switching)
+        final_loss = args.loss_phase2 if args.loss_phase2 and epochs_completed > args.phase2_epoch else args.loss
         test_metrics = eval_epoch(
             model, test_loader, device,
             dec_z, dec_x, n_qubits, mx, mz,
-            loss_fn=args.loss,
+            loss_fn=final_loss,
             pos_weight=args.pos_weight,
             focal_alpha=args.focal_alpha,
             focal_gamma=args.focal_gamma,
@@ -873,6 +1059,10 @@ def main(argv: List[str] | None = None) -> int:
             lx_t=lx_t, lz_t=lz_t,
             correction_mode=args.correction_mode,
             syn_weight=args.syn_weight, hx_t=hx_t, hz_t=hz_t,
+            coset_syn_weight=args.coset_syn_weight,
+            coset_logical_weight=args.coset_logical_weight,
+            interleaved=args.interleaved,
+            num_stages=args.num_stages,
         )
         print(
             f"Test Loss: {test_metrics['loss']:.6f} | "
@@ -899,6 +1089,11 @@ def main(argv: List[str] | None = None) -> int:
         "grad_clip": args.grad_clip,
         "scheduler": args.scheduler,
         "correction_mode": args.correction_mode,
+        "neural_bp": neural_bp,
+        "use_film": args.use_film,
+        "noise_feat_dim": args.noise_feat_dim,
+        "interleaved": args.interleaved,
+        "num_stages": args.num_stages,
         "accumulate_grad": args.accumulate_grad,
         "weight_decay": args.weight_decay,
         "pretrained": args.pretrained,
@@ -920,6 +1115,10 @@ def main(argv: List[str] | None = None) -> int:
     with open(log_path, "w") as f:
         json.dump(log, f, indent=2)
     print(f"Saved training log to {log_path}")
+
+    monitor.save(log)
+    monitor.print_summary()
+    print(f"CSV metrics: {monitor.csv_path}")
 
     return 0
 

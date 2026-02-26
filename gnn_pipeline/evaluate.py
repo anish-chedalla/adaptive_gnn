@@ -27,12 +27,12 @@ import math
 import pathlib
 import sys
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch_geometric.data import Data
+from torch_geometric.data import Data, Batch
 
 from gnn_pipeline.bp_decoder import MinSumBPDecoder
 from gnn_pipeline.dataset import _load_npz, _parse_meta
@@ -43,6 +43,127 @@ from gnn_pipeline.tanner_graph import build_tanner_graph
 # ---------------------------------------------------------------------------
 # Utility
 # ---------------------------------------------------------------------------
+
+def mcnemar_test(
+    outcomes_a: np.ndarray,
+    outcomes_b: np.ndarray,
+) -> Tuple[float, float]:
+    """McNemar's test for paired binary outcomes (with continuity correction).
+
+    Tests whether two decoders have significantly different logical error rates
+    on the same set of shots. More appropriate than unpaired proportion tests
+    because decoder outcomes on the same shot are correlated.
+
+    Args:
+        outcomes_a: (N,) bool array — True = logical error for decoder A
+        outcomes_b: (N,) bool array — True = logical error for decoder B
+
+    Returns:
+        (chi2, p_value): McNemar's test statistic and two-sided p-value.
+        Returns (0.0, 1.0) if the test is degenerate (n_01 + n_10 == 0).
+    """
+    a = outcomes_a.astype(bool)
+    b = outcomes_b.astype(bool)
+
+    # Discordant pairs
+    n_01 = int(np.sum(~a & b))  # A correct, B wrong
+    n_10 = int(np.sum(a & ~b))  # A wrong, B correct
+
+    n_disc = n_01 + n_10
+    if n_disc == 0:
+        return 0.0, 1.0
+
+    # McNemar's chi-squared with continuity correction
+    chi2 = (abs(n_01 - n_10) - 1) ** 2 / n_disc
+    # p-value from chi-squared distribution with 1 df
+    # Use survival function: P(X > chi2) for chi2(df=1)
+    # chi2 CDF via regularized incomplete gamma: P = 1 - gammainc(0.5, chi2/2)
+    # For chi2(df=1): p = erfc(sqrt(chi2/2))
+    p_value = _chi2_sf_1df(chi2)
+    return float(chi2), float(p_value)
+
+
+def _chi2_sf_1df(x: float) -> float:
+    """Survival function of chi-squared distribution with 1 degree of freedom.
+
+    P(X > x) = erfc(sqrt(x/2)) for chi2(df=1).
+    Uses math.erfc for accuracy without scipy dependency.
+    """
+    if x <= 0:
+        return 1.0
+    return math.erfc(math.sqrt(x / 2.0))
+
+
+def pairwise_significance(
+    decoder_outcomes: Dict[str, np.ndarray],
+    reference: str = "BP (stale LLR)",
+) -> List[dict]:
+    """Run McNemar's test between each decoder and a reference decoder.
+
+    Args:
+        decoder_outcomes: {decoder_name: (N,) bool array of logical errors}
+        reference: name of the reference decoder (default: plain BP)
+
+    Returns:
+        List of dicts with keys: decoder_a, decoder_b, chi2, p_value, significant
+    """
+    if reference not in decoder_outcomes:
+        return []
+
+    ref = decoder_outcomes[reference]
+    results = []
+    for name, outcomes in decoder_outcomes.items():
+        if name == reference:
+            continue
+        chi2, pval = mcnemar_test(ref, outcomes)
+        results.append({
+            "decoder_a": reference,
+            "decoder_b": name,
+            "chi2": round(chi2, 4),
+            "p_value": pval,
+            "significant": pval < 0.05,
+        })
+    return results
+
+
+def bootstrap_ler_difference_ci(
+    outcomes_a: np.ndarray,
+    outcomes_b: np.ndarray,
+    n_bootstrap: int = 2000,
+    confidence: float = 0.95,
+    seed: int = 42,
+) -> Tuple[float, float, float]:
+    """Bootstrap confidence interval for LER_A - LER_B.
+
+    Computes a percentile bootstrap CI for the *difference* in logical error
+    rate between two decoders on the same data.  A negative difference means
+    decoder B has lower (better) LER.
+
+    Args:
+        outcomes_a: (N,) bool — True when decoder A made a logical error
+        outcomes_b: (N,) bool — True when decoder B made a logical error
+        n_bootstrap: number of bootstrap resamples (default 2000)
+        confidence: CI level (default 0.95 for 95% CI)
+        seed: random seed for reproducibility
+
+    Returns:
+        (mean_diff, ci_low, ci_high) — mean difference and CI bounds
+    """
+    rng = np.random.default_rng(seed)
+    n = len(outcomes_a)
+    if n == 0:
+        return 0.0, 0.0, 0.0
+    a = outcomes_a.astype(np.float64)
+    b = outcomes_b.astype(np.float64)
+    diffs = np.empty(n_bootstrap)
+    for i in range(n_bootstrap):
+        idx = rng.integers(0, n, size=n)
+        diffs[i] = a[idx].mean() - b[idx].mean()
+    alpha = (1.0 - confidence) / 2.0
+    ci_low = float(np.percentile(diffs, 100 * alpha))
+    ci_high = float(np.percentile(diffs, 100 * (1.0 - alpha)))
+    return float(diffs.mean()), ci_low, ci_high
+
 
 def wilson_score_interval_binom(
     successes: int,
@@ -67,6 +188,81 @@ def wilson_score_interval_binom(
         max(0.0, center - margin),
         min(1.0, center + margin),
     )
+
+
+# ---------------------------------------------------------------------------
+# Vectorized Batch Construction
+# ---------------------------------------------------------------------------
+
+def _build_eval_batch(
+    all_x_syn_chunk: np.ndarray,
+    all_z_syn_chunk: np.ndarray,
+    avg_llr: float,
+    n: int,
+    mx: int,
+    mz: int,
+    edge_index: torch.Tensor,
+    edge_type: torch.Tensor,
+    node_type: torch.Tensor,
+    p_vals_chunk: np.ndarray,
+    device: torch.device,
+) -> Batch:
+    """Build a batched GNN input without per-sample Python loops.
+
+    Constructs the feature tensor, replicates the graph structure, and
+    returns a ready-to-use ``Batch`` on ``device``.
+
+    Args:
+        all_x_syn_chunk: (B, mx) X-syndrome values
+        all_z_syn_chunk: (B, mz) Z-syndrome values
+        avg_llr: average channel LLR (scalar, broadcast to all data qubits)
+        n, mx, mz: code dimensions
+        edge_index: (2, E) edge indices for a single graph
+        edge_type: (E,) edge types for a single graph
+        node_type: (num_nodes,) node types for a single graph
+        p_vals_chunk: (B,) per-shot noise estimate
+        device: target device
+
+    Returns:
+        ``Batch`` object with all fields set, on ``device``.
+    """
+    B = all_x_syn_chunk.shape[0]
+    num_nodes = n + mx + mz
+    E = edge_index.shape[1]
+
+    # --- Vectorized feature tensor: (B, num_nodes, 4) ---
+    x_3d = torch.zeros(B, num_nodes, 4, dtype=torch.float32)
+    x_3d[:, :n, 0] = avg_llr
+    x_3d[:, :n, 1] = 1.0
+    x_3d[:, n:n + mx, 0] = torch.from_numpy(all_x_syn_chunk).float()
+    x_3d[:, n:n + mx, 2] = 1.0
+    x_3d[:, n + mx:, 0] = torch.from_numpy(all_z_syn_chunk).float()
+    x_3d[:, n + mx:, 3] = 1.0
+
+    # --- Replicate graph with per-sample offsets ---
+    ei_cpu = edge_index.cpu()
+    offsets = torch.arange(B, dtype=torch.long).unsqueeze(1) * num_nodes  # (B, 1)
+    batch_ei = (
+        ei_cpu.unsqueeze(0).expand(B, 2, E) + offsets.unsqueeze(1)
+    ).reshape(2, -1)
+
+    batch_et = edge_type.cpu().repeat(B)
+    batch_nt = node_type.cpu().repeat(B)
+    batch_vec = torch.arange(B, dtype=torch.long).repeat_interleave(num_nodes)
+    batch_ch_llr = torch.full((B * n,), avg_llr, dtype=torch.float32)
+    batch_p = torch.from_numpy(p_vals_chunk.astype(np.float32))
+
+    batch = Batch(
+        x=x_3d.reshape(-1, 4),
+        edge_index=batch_ei,
+        edge_type=batch_et,
+        node_type=batch_nt,
+        channel_llr=batch_ch_llr,
+        p_value=batch_p,
+        batch=batch_vec,
+    )
+    batch._num_graphs = B
+    return batch.to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +348,7 @@ def run_gnn_css_bp_decoder(
     dec_z_prebuilt: Optional[MinSumBPDecoder] = None,
     dec_x_prebuilt: Optional[MinSumBPDecoder] = None,
     tanner_graph: Optional[Tuple] = None,
+    p_value: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, bool]:
     """Run GNN-assisted separate CSS BP decoding.
 
@@ -192,6 +389,9 @@ def run_gnn_css_bp_decoder(
         node_type=node_type_t,
         channel_llr=torch.full((n,), avg_llr, dtype=torch.float32).to(device),
     )
+    # Attach p_value for FiLM conditioning (if available)
+    if p_value is not None:
+        data_obj.p_value = torch.tensor(float(p_value), dtype=torch.float32).to(device)
 
     # Get GNN corrections and apply based on mode
     with torch.no_grad():
@@ -303,6 +503,8 @@ def evaluate_code_capacity(
     correction_mode: str = "additive",
     lsd_order: int = 0,
     lsd_method: str = "LSD_CS",
+    osd_order: int = 0,
+    checkpoint: Optional[dict] = None,
 ) -> dict:
     """Evaluate decoders in code-capacity mode (separate CSS decoding).
 
@@ -476,11 +678,39 @@ def evaluate_code_capacity(
     # ---------- Batched GNN-BP decoding ----------
     gnn_bp_errors = 0
     gnn_bp_converged = 0
+    interleaved_bp_errors = 0
+    interleaved_bp_converged = 0
+    has_neural_bp = checkpoint is not None and checkpoint.get("neural_bp", False)
+    has_interleaved = has_neural_bp  # interleaved requires neural BP weights
+
     if gnn_model is not None:
         print("\nBatched GNN-BP decoding (stale LLR + GNN correction)...")
         t_gnn = time.time()
 
-        # GNN runs per-shot (graph-level), but BP is batched after corrections
+        # Build Neural BP decoders if checkpoint has trained weights
+        ckpt_bp_iters = checkpoint.get("bp_iters", 10) if checkpoint else 10
+        # Use 100 total iters: first ckpt_bp_iters use learned weights, rest use vanilla BP
+        eval_bp_iters = 100
+        if has_neural_bp:
+            print(f"  Loading Neural BP weights (trained={ckpt_bp_iters} iters, eval={eval_bp_iters} iters)...")
+            gnn_dec_z = MinSumBPDecoder(
+                hx, max_iter=eval_bp_iters, alpha=0.8, clamp_llr=20.0, neural_bp=True
+            ).to(device)
+            gnn_dec_x = MinSumBPDecoder(
+                hz, max_iter=eval_bp_iters, alpha=0.8, clamp_llr=20.0, neural_bp=True
+            ).to(device)
+            # Load trained weights (covers first ckpt_bp_iters iterations)
+            # Remaining iterations automatically fall back to vanilla BP
+            gnn_dec_z.load_state_dict(checkpoint["dec_z_state_dict"], strict=False)
+            gnn_dec_x.load_state_dict(checkpoint["dec_x_state_dict"], strict=False)
+            gnn_dec_z.eval()
+            gnn_dec_x.eval()
+            print(f"  Neural BP: learned weights for iters 1-{ckpt_bp_iters}, vanilla BP for iters {ckpt_bp_iters+1}-{eval_bp_iters}")
+        else:
+            gnn_dec_z = dec_z_pre
+            gnn_dec_x = dec_x_pre
+
+        # Batched GNN evaluation: build Tanner graph once, batch all shots
         node_type_np, edge_index_np, edge_type_np = build_tanner_graph(hx, hz)
         node_type_t = torch.from_numpy(node_type_np).long().to(device)
         edge_index_t = torch.from_numpy(edge_index_np).long().to(device)
@@ -491,60 +721,51 @@ def evaluate_code_capacity(
         gnn_hard_x_all = []
         gnn_conv_all = []
 
+        avg_llr = (llr_z_stale + llr_x_stale) / 2.0
+
+        # Pre-compute p_value array for vectorized batch construction
+        if has_per_shot_p:
+            p_vals_arr = p_vals.astype(np.float32)
+        else:
+            p_vals_arr = np.full(shots, float(p), dtype=np.float32)
+
         for start in range(0, shots, CHUNK):
             end = min(start + CHUNK, shots)
             B_chunk = end - start
 
-            # Build per-shot GNN corrections (GNN sees stale LLR + syndrome)
-            corrections_z = np.zeros((B_chunk, n), dtype=np.float32)
-            corrections_x = np.zeros((B_chunk, n), dtype=np.float32)
-
-            for i in range(B_chunk):
-                si = start + i
-                x_feat = torch.zeros(num_nodes, 4, dtype=torch.float32)
-                avg_llr = (llr_z_stale + llr_x_stale) / 2.0
-                x_feat[:n, 0] = avg_llr
-                x_feat[:n, 1] = 1.0
-                x_feat[n:n+mx, 0] = torch.from_numpy(all_x_syn[si]).float()
-                x_feat[n:n+mx, 2] = 1.0
-                x_feat[n+mx:, 0] = torch.from_numpy(all_z_syn[si]).float()
-                x_feat[n+mx:, 3] = 1.0
-
-                data_obj = Data(
-                    x=x_feat.to(device),
-                    edge_index=edge_index_t,
-                    edge_type=edge_type_t,
-                    node_type=node_type_t,
-                    channel_llr=torch.full((n,), avg_llr, dtype=torch.float32, device=device),
-                )
-
-                with torch.no_grad():
-                    gnn_model.eval()
-                    gnn_out = gnn_model(data_obj)
-
-                llr_z_s = torch.full((n,), llr_z_stale, dtype=torch.float32, device=device)
-                llr_x_s = torch.full((n,), llr_x_stale, dtype=torch.float32, device=device)
-
-                if correction_mode == "both":
-                    add_c, mul_c = gnn_out
-                    add_c = torch.clamp(add_c, -20.0, 20.0)
-                    mul_c = torch.clamp(mul_c, -5.0, 5.0)
-                    gnn_out = (add_c, mul_c)
-                else:
-                    gnn_out = torch.clamp(gnn_out, -20.0, 20.0)
-
-                corrections_z[i] = apply_correction(llr_z_s, gnn_out, correction_mode).cpu().numpy()
-                corrections_x[i] = apply_correction(llr_x_s, gnn_out, correction_mode).cpu().numpy()
-
-            # Batched BP with corrected LLRs
-            x_syn_t = torch.from_numpy(all_x_syn[start:end]).float().to(device)
-            z_syn_t = torch.from_numpy(all_z_syn[start:end]).float().to(device)
-            corr_z_t = torch.from_numpy(corrections_z).float().to(device)
-            corr_x_t = torch.from_numpy(corrections_x).float().to(device)
+            # Vectorized batch construction (no per-shot Python loop)
+            batch_data = _build_eval_batch(
+                all_x_syn[start:end], all_z_syn[start:end],
+                avg_llr, n, mx, mz,
+                edge_index_t, edge_type_t, node_type_t,
+                p_vals_arr[start:end], device,
+            )
 
             with torch.no_grad():
-                _, hard_z, conv_z = dec_z_pre(x_syn_t, corr_z_t)
-                _, hard_x, conv_x = dec_x_pre(z_syn_t, corr_x_t)
+                gnn_model.eval()
+                gnn_out = gnn_model(batch_data)
+
+            # Reshape GNN output from flat to (B, n) and apply corrections
+            if correction_mode == "both":
+                add_c, mul_c = gnn_out
+                add_c = torch.clamp(add_c, -20.0, 20.0).view(B_chunk, n)
+                mul_c = torch.clamp(mul_c, -5.0, 5.0).view(B_chunk, n)
+                gnn_out_batched = (add_c, mul_c)
+            else:
+                gnn_out_batched = torch.clamp(gnn_out, -20.0, 20.0).view(B_chunk, n)
+
+            llr_z_batch = torch.full((B_chunk, n), llr_z_stale, dtype=torch.float32, device=device)
+            llr_x_batch = torch.full((B_chunk, n), llr_x_stale, dtype=torch.float32, device=device)
+            corrections_z_t = apply_correction(llr_z_batch, gnn_out_batched, correction_mode)
+            corrections_x_t = apply_correction(llr_x_batch, gnn_out_batched, correction_mode)
+
+            # Batched BP with corrected LLRs (using Neural BP decoders if available)
+            x_syn_t = torch.from_numpy(all_x_syn[start:end]).float().to(device)
+            z_syn_t = torch.from_numpy(all_z_syn[start:end]).float().to(device)
+
+            with torch.no_grad():
+                _, hard_z, conv_z = gnn_dec_z(x_syn_t, corrections_z_t)
+                _, hard_x, conv_x = gnn_dec_x(z_syn_t, corrections_x_t)
 
             gnn_hard_z_all.append(hard_z.cpu().numpy())
             gnn_hard_x_all.append(hard_x.cpu().numpy())
@@ -562,6 +783,120 @@ def evaluate_code_capacity(
         gnn_bp_errors = int(gnn_logical.sum())
         gnn_bp_converged = int(gnn_conv.sum())
         print(f"  GNN-BP done: {shots / (time.time() - t_gnn):.0f} shots/s")
+
+    # ---------- Interleaved GNN-BP decoding ----------
+    if gnn_model is not None and has_interleaved:
+        print("\nInterleaved GNN-BP decoding (GNN corrects mid-BP)...")
+        t_inter = time.time()
+
+        # Build Neural BP decoders for interleaved mode with extended iterations
+        # Stage 1: neural BP iters, then GNN correction, then Stage 2: vanilla BP iters
+        stage1_iters = ckpt_bp_iters  # learned weights
+        stage2_iters = 90             # vanilla BP continuation
+        num_stages = 2
+        total_inter_iters = stage1_iters + stage2_iters
+        print(f"  Stage 1: {stage1_iters} neural iters, Stage 2: {stage2_iters} vanilla iters = {total_inter_iters} total")
+
+        inter_dec_z = MinSumBPDecoder(
+            hx, max_iter=total_inter_iters, alpha=0.8, clamp_llr=20.0, neural_bp=True
+        ).to(device)
+        inter_dec_x = MinSumBPDecoder(
+            hz, max_iter=total_inter_iters, alpha=0.8, clamp_llr=20.0, neural_bp=True
+        ).to(device)
+        inter_dec_z.load_state_dict(checkpoint["dec_z_state_dict"], strict=False)
+        inter_dec_x.load_state_dict(checkpoint["dec_x_state_dict"], strict=False)
+        inter_dec_z.eval()
+        inter_dec_x.eval()
+
+        inter_hard_z_all = []
+        inter_hard_x_all = []
+        inter_conv_all = []
+
+        for start in range(0, shots, CHUNK):
+            end = min(start + CHUNK, shots)
+            B_chunk = end - start
+
+            x_syn_t = torch.from_numpy(all_x_syn[start:end]).float().to(device)
+            z_syn_t = torch.from_numpy(all_z_syn[start:end]).float().to(device)
+            llr_z_t = torch.full((B_chunk, n), llr_z_stale, dtype=torch.float32, device=device)
+            llr_x_t = torch.full((B_chunk, n), llr_x_stale, dtype=torch.float32, device=device)
+
+            # Correction function: runs GNN on each sample's current BP state
+            def _make_correction_fn(syn_x_chunk, syn_z_chunk, shot_offset):
+                def correction_fn(mid_marginals, current_llr, stage_idx):
+                    """GNN sees current BP marginals and corrects LLRs."""
+                    B_c = mid_marginals.shape[0]
+                    corrected = current_llr.clone()
+                    for i in range(B_c):
+                        si = shot_offset + i
+                        # Build features with BP marginal as 5th feature
+                        x_feat = torch.zeros(num_nodes, 4, dtype=torch.float32)
+                        avg_llr = (llr_z_stale + llr_x_stale) / 2.0
+                        x_feat[:n, 0] = avg_llr
+                        x_feat[:n, 1] = 1.0
+                        x_feat[n:n+mx, 0] = syn_x_chunk[i]
+                        x_feat[n:n+mx, 2] = 1.0
+                        x_feat[n+mx:, 0] = syn_z_chunk[i]
+                        x_feat[n+mx:, 3] = 1.0
+
+                        data_obj = Data(
+                            x=x_feat.to(device),
+                            edge_index=edge_index_t,
+                            edge_type=edge_type_t,
+                            node_type=node_type_t,
+                            channel_llr=torch.full((n,), avg_llr, dtype=torch.float32, device=device),
+                        )
+                        if has_per_shot_p:
+                            data_obj.p_value = torch.tensor(float(p_vals[si]), dtype=torch.float32).to(device)
+                        else:
+                            data_obj.p_value = torch.tensor(float(p), dtype=torch.float32).to(device)
+
+                        with torch.no_grad():
+                            gnn_out = gnn_model(data_obj)
+
+                        if correction_mode == "both":
+                            add_c, mul_c = gnn_out
+                            add_c = torch.clamp(add_c, -20.0, 20.0)
+                            mul_c = torch.clamp(mul_c, -5.0, 5.0)
+                            gnn_out_batched = (add_c.unsqueeze(0), mul_c.unsqueeze(0))
+                        else:
+                            gnn_out_batched = torch.clamp(gnn_out, -20.0, 20.0).unsqueeze(0)
+
+                        corrected[i] = apply_correction(current_llr[i:i+1], gnn_out_batched, correction_mode).squeeze(0)
+                    return corrected
+                return correction_fn
+
+            with torch.no_grad():
+                # Z-errors: hx @ z_error = x_syndrome
+                # Stage 1: neural BP iters, then GNN correction, then Stage 2: vanilla BP
+                _, hard_z, conv_z = inter_dec_z.forward_stages(
+                    x_syn_t, llr_z_t,
+                    stage_iters=[stage1_iters, stage2_iters],
+                    correction_fn=_make_correction_fn(x_syn_t, z_syn_t, start),
+                )
+                # X-errors: hz @ x_error = z_syndrome
+                _, hard_x, conv_x = inter_dec_x.forward_stages(
+                    z_syn_t, llr_x_t,
+                    stage_iters=[stage1_iters, stage2_iters],
+                    correction_fn=_make_correction_fn(x_syn_t, z_syn_t, start),
+                )
+
+            inter_hard_z_all.append(hard_z.cpu().numpy())
+            inter_hard_x_all.append(hard_x.cpu().numpy())
+            inter_conv_all.append((conv_z & conv_x).cpu().numpy())
+
+            if end % max(1, shots // 5) < CHUNK:
+                elapsed = time.time() - t_inter
+                print(f"  Interleaved: {end}/{shots} shots ({end / elapsed:.0f} shots/s)")
+
+        inter_z_errors = np.concatenate(inter_hard_z_all, axis=0)
+        inter_x_errors = np.concatenate(inter_hard_x_all, axis=0)
+        inter_conv = np.concatenate(inter_conv_all, axis=0)
+
+        inter_logical = _check_logical_errors_batch(inter_z_errors, inter_x_errors, lx, lz, observables)
+        interleaved_bp_errors = int(inter_logical.sum())
+        interleaved_bp_converged = int(inter_conv.sum())
+        print(f"  Interleaved done: {shots / (time.time() - t_inter):.0f} shots/s")
 
     # ---------- BP-OSD (parallel with threads) ----------
     # Use ThreadPoolExecutor: BP-OSD and MWPM are C-extension-backed
@@ -711,56 +1046,43 @@ def evaluate_code_capacity(
         t_gnn_lsd = time.time()
         n_workers = max(1, os.cpu_count() - 1)
 
-        # First compute GNN corrections for all shots (reuse from GNN-BP if available)
-        node_type_np2, edge_index_np2, edge_type_np2 = build_tanner_graph(hx, hz)
-        node_type_t2 = torch.from_numpy(node_type_np2).long().to(device)
-        edge_index_t2 = torch.from_numpy(edge_index_np2).long().to(device)
-        edge_type_t2 = torch.from_numpy(edge_type_np2).long().to(device)
-        num_nodes2 = n + mx + mz
-
-        # Collect per-shot corrected LLRs
+        # Batched GNN corrections (reuse cached Tanner graph from GNN-BP above)
         all_corr_llr_z = np.zeros((shots, n), dtype=np.float32)
         all_corr_llr_x = np.zeros((shots, n), dtype=np.float32)
+        avg_llr_lsd = (llr_z_stale + llr_x_stale) / 2.0
 
-        for si in range(shots):
-            x_feat = torch.zeros(num_nodes2, 4, dtype=torch.float32)
-            avg_llr = (llr_z_stale + llr_x_stale) / 2.0
-            x_feat[:n, 0] = avg_llr
-            x_feat[:n, 1] = 1.0
-            x_feat[n:n+mx, 0] = torch.from_numpy(all_x_syn[si]).float()
-            x_feat[n:n+mx, 2] = 1.0
-            x_feat[n+mx:, 0] = torch.from_numpy(all_z_syn[si]).float()
-            x_feat[n+mx:, 3] = 1.0
+        for start_lsd in range(0, shots, CHUNK):
+            end_lsd = min(start_lsd + CHUNK, shots)
+            B_lsd = end_lsd - start_lsd
 
-            data_obj = Data(
-                x=x_feat.to(device),
-                edge_index=edge_index_t2,
-                edge_type=edge_type_t2,
-                node_type=node_type_t2,
-                channel_llr=torch.full((n,), avg_llr, dtype=torch.float32, device=device),
+            # Vectorized batch construction
+            batch_lsd = _build_eval_batch(
+                all_x_syn[start_lsd:end_lsd], all_z_syn[start_lsd:end_lsd],
+                avg_llr_lsd, n, mx, mz,
+                edge_index_t, edge_type_t, node_type_t,
+                p_vals_arr[start_lsd:end_lsd], device,
             )
 
             with torch.no_grad():
                 gnn_model.eval()
-                gnn_out = gnn_model(data_obj)
-
-            llr_z_s = torch.full((n,), llr_z_stale, dtype=torch.float32, device=device)
-            llr_x_s = torch.full((n,), llr_x_stale, dtype=torch.float32, device=device)
+                gnn_out_lsd = gnn_model(batch_lsd)
 
             if correction_mode == "both":
-                add_c, mul_c = gnn_out
-                add_c = torch.clamp(add_c, -20.0, 20.0)
-                mul_c = torch.clamp(mul_c, -5.0, 5.0)
-                gnn_out = (add_c, mul_c)
+                add_c, mul_c = gnn_out_lsd
+                add_c = torch.clamp(add_c, -20.0, 20.0).view(B_lsd, n)
+                mul_c = torch.clamp(mul_c, -5.0, 5.0).view(B_lsd, n)
+                gnn_out_lsd = (add_c, mul_c)
             else:
-                gnn_out = torch.clamp(gnn_out, -20.0, 20.0)
+                gnn_out_lsd = torch.clamp(gnn_out_lsd, -20.0, 20.0).view(B_lsd, n)
 
-            all_corr_llr_z[si] = apply_correction(llr_z_s, gnn_out, correction_mode).cpu().numpy()
-            all_corr_llr_x[si] = apply_correction(llr_x_s, gnn_out, correction_mode).cpu().numpy()
+            llr_z_b = torch.full((B_lsd, n), llr_z_stale, dtype=torch.float32, device=device)
+            llr_x_b = torch.full((B_lsd, n), llr_x_stale, dtype=torch.float32, device=device)
+            all_corr_llr_z[start_lsd:end_lsd] = apply_correction(llr_z_b, gnn_out_lsd, correction_mode).cpu().numpy()
+            all_corr_llr_x[start_lsd:end_lsd] = apply_correction(llr_x_b, gnn_out_lsd, correction_mode).cpu().numpy()
 
-            if (si + 1) % max(1, shots // 5) == 0:
+            if end_lsd % max(1, shots // 5) < CHUNK:
                 elapsed_gnn = time.time() - t_gnn_lsd
-                print(f"  GNN corrections: {si+1}/{shots} ({(si+1)/elapsed_gnn:.0f} shots/s)")
+                print(f"  GNN corrections: {end_lsd}/{shots} ({end_lsd/elapsed_gnn:.0f} shots/s)")
 
         # Now run BP-LSD with per-qubit corrected LLRs (parallel)
         print("  Running BP-LSD with GNN-corrected LLRs...")
@@ -780,6 +1102,76 @@ def evaluate_code_capacity(
 
         gnn_bplsd_errors = sum(results_gnn_bplsd)
         print(f"  GNN+BP-LSD done: {shots / (time.time() - t_gnn_lsd):.0f} shots/s total")
+
+    # ---------- GNN + BP-OSD (novel combination) ----------
+    gnn_bposd_errors = 0
+    gnn_bposd_available = False
+    if gnn_model is not None and use_bposd:
+        try:
+            from gnn_pipeline.bposd_decoder import run_css_bposd_with_llr
+            gnn_bposd_available = True
+        except ImportError:
+            pass
+
+    if gnn_bposd_available:
+        import concurrent.futures
+        import os
+
+        print("GNN + BP-OSD decoding (GNN corrections -> BP-OSD post-process)...")
+        t_gnn_osd = time.time()
+        n_workers = max(1, os.cpu_count() - 1)
+
+        # Batched GNN corrections (reuse cached Tanner graph)
+        all_corr_llr_z_osd = np.zeros((shots, n), dtype=np.float32)
+        all_corr_llr_x_osd = np.zeros((shots, n), dtype=np.float32)
+        avg_llr_osd = (llr_z_stale + llr_x_stale) / 2.0
+
+        for start_osd in range(0, shots, CHUNK):
+            end_osd = min(start_osd + CHUNK, shots)
+            B_osd = end_osd - start_osd
+
+            # Vectorized batch construction
+            batch_osd = _build_eval_batch(
+                all_x_syn[start_osd:end_osd], all_z_syn[start_osd:end_osd],
+                avg_llr_osd, n, mx, mz,
+                edge_index_t, edge_type_t, node_type_t,
+                p_vals_arr[start_osd:end_osd], device,
+            )
+
+            with torch.no_grad():
+                gnn_model.eval()
+                gnn_out_osd = gnn_model(batch_osd)
+
+            if correction_mode == "both":
+                add_c, mul_c = gnn_out_osd
+                add_c = torch.clamp(add_c, -20.0, 20.0).view(B_osd, n)
+                mul_c = torch.clamp(mul_c, -5.0, 5.0).view(B_osd, n)
+                gnn_out_osd = (add_c, mul_c)
+            else:
+                gnn_out_osd = torch.clamp(gnn_out_osd, -20.0, 20.0).view(B_osd, n)
+
+            llr_z_b = torch.full((B_osd, n), llr_z_stale, dtype=torch.float32, device=device)
+            llr_x_b = torch.full((B_osd, n), llr_x_stale, dtype=torch.float32, device=device)
+            all_corr_llr_z_osd[start_osd:end_osd] = apply_correction(llr_z_b, gnn_out_osd, correction_mode).cpu().numpy()
+            all_corr_llr_x_osd[start_osd:end_osd] = apply_correction(llr_x_b, gnn_out_osd, correction_mode).cpu().numpy()
+
+        # Now run BP-OSD with per-qubit corrected LLRs (parallel)
+        print("  Running BP-OSD with GNN-corrected LLRs...")
+
+        def _gnn_bposd_shot(idx):
+            z_e, x_e = run_css_bposd_with_llr(
+                all_x_syn[idx], all_z_syn[idx], hx, hz,
+                per_qubit_llr_z=all_corr_llr_z_osd[idx],
+                per_qubit_llr_x=all_corr_llr_x_osd[idx],
+                osd_order=osd_order,
+            )
+            return _check_logical_error(z_e, x_e, lx, lz, observables[idx])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results_gnn_bposd = list(pool.map(_gnn_bposd_shot, range(shots)))
+
+        gnn_bposd_errors = sum(results_gnn_bposd)
+        print(f"  GNN+BP-OSD done: {shots / (time.time() - t_gnn_osd):.0f} shots/s total")
 
     elapsed = time.time() - t_start
 
@@ -852,6 +1244,27 @@ def evaluate_code_capacity(
             "convergence_rate": float(gnn_bp_converged / shots),
         }
         results["improvement_pct"] = float(100 * improvement)
+
+    if gnn_model is not None and has_interleaved:
+        inter_ler = interleaved_bp_errors / shots if shots > 0 else 0.0
+        inter_ler_low, inter_ler_high = wilson_score_interval_binom(interleaved_bp_errors, shots)
+
+        print(f"\nInterleaved GNN-BP (GNN corrects mid-BP, Neural BP weights):")
+        print(f"  Logical Error Rate: {inter_ler:.6f}")
+        print(f"  95% CI: [{inter_ler_low:.6f}, {inter_ler_high:.6f}]")
+        print(f"  Errors: {interleaved_bp_errors}/{shots}")
+        print(f"  Convergence: {interleaved_bp_converged}/{shots} ({100*interleaved_bp_converged/shots:.1f}%)")
+
+        inter_improvement = (bp_ler - inter_ler) / bp_ler if bp_ler > 0 else 0.0
+        print(f"  Improvement over stale BP: {100*inter_improvement:.1f}%")
+
+        results["interleaved_gnn_bp"] = {
+            "errors": int(interleaved_bp_errors),
+            "ler": float(inter_ler),
+            "ler_ci_low": float(inter_ler_low),
+            "ler_ci_high": float(inter_ler_high),
+            "convergence_rate": float(interleaved_bp_converged / shots),
+        }
 
     if bposd_available:
         bposd_ler = bposd_errors / shots if shots > 0 else 0.0
@@ -952,6 +1365,54 @@ def evaluate_code_capacity(
             "ler_ci_high": float(gnn_bplsd_ler_high),
         }
 
+    if gnn_bposd_available:
+        gnn_bposd_ler = gnn_bposd_errors / shots if shots > 0 else 0.0
+        gnn_bposd_ler_low, gnn_bposd_ler_high = wilson_score_interval_binom(gnn_bposd_errors, shots)
+
+        print(f"\nGNN + BP-OSD Decoder (GNN-corrected LLRs -> BP-OSD):")
+        print(f"  Logical Error Rate: {gnn_bposd_ler:.6f}")
+        print(f"  95% CI: [{gnn_bposd_ler_low:.6f}, {gnn_bposd_ler_high:.6f}]")
+        print(f"  Errors: {gnn_bposd_errors}/{shots}")
+
+        bp_vs_gnn_bposd = (bp_ler - gnn_bposd_ler) / bp_ler if bp_ler > 0 else 0.0
+        print(f"  Improvement over BP: {100*bp_vs_gnn_bposd:.1f}%")
+
+        if bposd_available:
+            osd_vs_gnn_osd = (bposd_ler - gnn_bposd_ler) / bposd_ler if bposd_ler > 0 else 0.0
+            print(f"  Improvement over plain BP-OSD: {100*osd_vs_gnn_osd:.1f}%")
+
+        results["gnn_bposd"] = {
+            "errors": int(gnn_bposd_errors),
+            "ler": float(gnn_bposd_ler),
+            "ler_ci_low": float(gnn_bposd_ler_low),
+            "ler_ci_high": float(gnn_bposd_ler_high),
+        }
+
+    # ---------- Collect per-shot outcomes for statistical testing ----------
+    decoder_outcomes = {"BP (stale LLR)": bp_logical}
+    if has_per_shot_p:
+        decoder_outcomes["Oracle BP"] = oracle_logical
+    if gnn_model is not None:
+        decoder_outcomes["GNN-BP"] = gnn_logical
+    if gnn_model is not None and has_interleaved:
+        decoder_outcomes["Interleaved GNN-BP"] = inter_logical
+    if bposd_available:
+        decoder_outcomes["BP-OSD"] = np.array(results_bposd, dtype=bool)
+    if bplsd_available:
+        decoder_outcomes["BP-LSD"] = np.array(results_bplsd, dtype=bool)
+    if bf_available:
+        decoder_outcomes["BeliefFind"] = np.array(results_bf, dtype=bool)
+    if gnn_bplsd_available:
+        decoder_outcomes["GNN + BP-LSD"] = np.array(results_gnn_bplsd, dtype=bool)
+    if gnn_bposd_available:
+        decoder_outcomes["GNN + BP-OSD"] = np.array(results_gnn_bposd, dtype=bool)
+    if mwpm_available:
+        decoder_outcomes["MWPM"] = np.array(results_mwpm, dtype=bool)
+
+    # Run McNemar's test (each decoder vs BP baseline)
+    stat_tests = pairwise_significance(decoder_outcomes, reference="BP (stale LLR)")
+    pval_lookup = {t["decoder_b"]: t["p_value"] for t in stat_tests}
+
     # ---------- Sorted Comparison Table ----------
     decoder_table = []
     decoder_table.append(("BP (stale LLR)", bp_ler))
@@ -969,19 +1430,35 @@ def evaluate_code_capacity(
         decoder_table.append(("BeliefFind", bf_ler))
     if gnn_bplsd_available:
         decoder_table.append(("GNN + BP-LSD", gnn_bplsd_ler))
+    if gnn_bposd_available:
+        decoder_table.append(("GNN + BP-OSD", gnn_bposd_ler))
+    if gnn_model is not None and has_interleaved:
+        inter_ler_val = interleaved_bp_errors / shots if shots > 0 else 0.0
+        decoder_table.append(("Interleaved GNN-BP", inter_ler_val))
     if mwpm_available:
         decoder_table.append(("MWPM", mwpm_ler))
 
     decoder_table.sort(key=lambda x: x[1])
 
-    print(f"\n{'='*50}")
+    print(f"\n{'='*60}")
     print(f"  Decoder Comparison (sorted by LER)")
-    print(f"{'='*50}")
+    print(f"{'='*60}")
     for rank, (name, ler_val) in enumerate(decoder_table, 1):
         improv = (bp_ler - ler_val) / bp_ler * 100 if bp_ler > 0 else 0.0
         tag = " (best)" if rank == 1 else ""
-        print(f"  {rank}. {name:20s}  LER = {ler_val:.6f}  ({improv:+.1f}% vs BP){tag}")
-    print(f"{'='*50}")
+        pval = pval_lookup.get(name)
+        if pval is not None:
+            sig = "*" if pval < 0.05 else " "
+            pstr = f"  p={pval:.4f}{sig}" if pval >= 0.0001 else f"  p<0.0001*"
+        else:
+            pstr = "  (ref)     "
+        print(f"  {rank}. {name:20s}  LER={ler_val:.6f}  ({improv:+.1f}% vs BP){pstr}{tag}")
+    print(f"{'='*60}")
+    print(f"  McNemar's test vs BP baseline (* = p < 0.05)")
+
+    # Store statistical tests in results
+    if stat_tests:
+        results["statistical_tests"] = stat_tests
 
     return results
 
@@ -991,13 +1468,19 @@ def evaluate_circuit_level(
     meta: dict,
     device: torch.device,
     use_bposd: bool = False,
+    gnn_model: Optional[nn.Module] = None,
+    correction_mode: str = "additive",
+    checkpoint: Optional[dict] = None,
 ) -> dict:
     """Evaluate decoders in circuit-level mode (DEM-based decoding).
+
+    Supports: plain BP, BP-OSD, and GNN-assisted BP on DEM.
 
     Returns:
         Dictionary with results for each decoder.
     """
     from gnn_pipeline.dem_decoder import extract_dem_pcm, build_dem_bp_decoder, run_dem_bp_decoder
+    from gnn_pipeline.tanner_graph import build_dem_tanner_graph
 
     syndromes = npz_data["syndromes"].astype(np.float32)
     observables = npz_data["observables"].astype(np.float32)
@@ -1029,6 +1512,10 @@ def evaluate_circuit_level(
     print(f"Error probs range: [{error_probs.min():.6f}, {error_probs.max():.6f}]")
     print(f"Observable matrix: ({obs_matrix.shape[0]} errors x {obs_matrix.shape[1]} obs)")
 
+    # Pre-compute channel LLRs
+    p_clamped = np.clip(error_probs, 1e-10, 1.0 - 1e-10)
+    prior_llr = np.log((1.0 - p_clamped) / p_clamped).astype(np.float32)
+
     # Optionally load BP-OSD for DEM
     bposd_dem_available = False
     if use_bposd:
@@ -1039,12 +1526,43 @@ def evaluate_circuit_level(
         except ImportError as e:
             print(f"Warning: BP-OSD not available: {e}")
 
-    # Pre-build BP decoder (expensive — do once, reuse for all shots)
+    # Pre-build BP decoder (expensive -- do once, reuse for all shots)
     print("Building DEM BP decoder...")
     dem_decoder, dem_channel_llr = build_dem_bp_decoder(
         dem_pcm, error_probs, device, max_iter=100
     )
     print("  Done.")
+
+    # --- GNN-BP setup (if GNN model provided) ---
+    has_gnn = gnn_model is not None
+    has_neural_bp = checkpoint is not None and checkpoint.get("neural_bp", False)
+    gnn_dec = None
+
+    if has_gnn:
+        print("\nSetting up GNN-BP for circuit-level...")
+
+        # Build DEM Tanner graph for GNN
+        node_type_np, edge_index_np, edge_type_np = build_dem_tanner_graph(dem_pcm)
+        node_type_t = torch.from_numpy(node_type_np).long().to(device)
+        edge_index_t = torch.from_numpy(edge_index_np).long().to(device)
+        edge_type_t = torch.from_numpy(edge_type_np).long().to(device)
+        prior_llr_t = torch.from_numpy(prior_llr).float().to(device)
+        num_nodes = num_errors + num_detectors
+
+        # Build Neural BP decoder if checkpoint has trained weights
+        ckpt_bp_iters = checkpoint.get("bp_iters", 10) if checkpoint else 10
+        eval_bp_iters = 100  # extend to full 100 iterations for eval
+        if has_neural_bp:
+            print(f"  Neural BP: trained={ckpt_bp_iters} iters, eval={eval_bp_iters} iters")
+            gnn_dec = MinSumBPDecoder(
+                dem_pcm, max_iter=eval_bp_iters, alpha=0.8, clamp_llr=20.0, neural_bp=True
+            ).to(device)
+            gnn_dec.load_state_dict(checkpoint["decoder_state_dict"], strict=False)
+            gnn_dec.eval()
+        else:
+            gnn_dec = dem_decoder  # reuse plain BP decoder
+
+        p_val = float(meta.get("p", 0.005))
 
     # Run evaluation
     print("\nEvaluating circuit-level decoding...")
@@ -1054,47 +1572,155 @@ def evaluate_circuit_level(
     bp_converged = 0
     bposd_errors = 0
     bposd_converged = 0
+    gnn_bp_errors = 0
+    gnn_bp_converged = 0
 
-    for shot_idx in range(shots):
-        det_row = syndromes[shot_idx].astype(np.int64)
-        observable = observables[shot_idx].astype(np.int64)
+    # Per-shot outcome arrays for statistical testing
+    bp_logical_all = []
+    gnn_logical_all = []
 
-        # --- BP on DEM ---
-        pred_obs_bp, conv_bp = run_dem_bp_decoder(
-            det_row, dem_pcm, error_probs, obs_matrix, device, max_iter=100,
-            decoder=dem_decoder, channel_llr=dem_channel_llr,
-        )
-        bp_converged += int(conv_bp)
+    CHUNK = 512  # Batch size for batched BP
 
-        # Check logical error: compare predicted observable flips vs actual
-        n_obs_check = min(len(pred_obs_bp), len(observable))
-        bp_logical_err = bool(np.any(pred_obs_bp[:n_obs_check] != observable[:n_obs_check]))
-        bp_errors += int(bp_logical_err)
+    # --- Batched plain BP on DEM ---
+    print("Batched BP decoding on DEM...")
+    t_bp = time.time()
+    for start in range(0, shots, CHUNK):
+        end = min(start + CHUNK, shots)
+        B_chunk = end - start
 
-        # --- BP-OSD on DEM ---
-        if bposd_dem_available:
+        syn_t = torch.from_numpy(syndromes[start:end]).float().to(device)
+        llr_t = torch.from_numpy(
+            np.broadcast_to(prior_llr[None, :], (B_chunk, num_errors)).copy()
+        ).float().to(device)
+
+        with torch.no_grad():
+            _, hard, converged = dem_decoder(syn_t, llr_t)
+
+        hard_np = hard.cpu().numpy()  # (B, num_errors)
+        conv_np = converged.cpu().numpy()
+
+        # Map to observables
+        pred_obs = (hard_np @ obs_matrix) % 2  # (B, num_obs)
+        obs_actual = observables[start:end].astype(np.int64)
+        n_obs_check = min(pred_obs.shape[1], obs_actual.shape[1])
+        logical_err = np.any(pred_obs[:, :n_obs_check] != obs_actual[:, :n_obs_check], axis=1)
+
+        bp_logical_all.append(logical_err)
+        bp_errors += int(logical_err.sum())
+        bp_converged += int(conv_np.sum())
+
+        if end % max(1, shots // 5) < CHUNK:
+            elapsed = time.time() - t_bp
+            print(f"  BP: {end}/{shots} shots ({end / elapsed:.0f} shots/s)")
+
+    bp_logical_arr = np.concatenate(bp_logical_all)
+    print(f"  BP done: {shots / (time.time() - t_bp):.0f} shots/s")
+
+    # --- Batched GNN-BP on DEM ---
+    if has_gnn:
+        print("\nGNN-BP decoding on DEM...")
+        t_gnn = time.time()
+
+        for start in range(0, shots, CHUNK):
+            end = min(start + CHUNK, shots)
+            B_chunk = end - start
+
+            # Compute per-shot GNN corrections
+            corrections = np.zeros((B_chunk, num_errors), dtype=np.float32)
+            for i in range(B_chunk):
+                si = start + i
+                det_events = syndromes[si]
+
+                # Build node features
+                x_feat = torch.zeros(num_nodes, 4, dtype=torch.float32)
+                x_feat[:num_errors, 0] = prior_llr_t
+                x_feat[:num_errors, 1] = 1.0
+                x_feat[num_errors:, 0] = torch.from_numpy(det_events).float()
+                x_feat[num_errors:, 2] = 1.0
+
+                data_obj = Data(
+                    x=x_feat.to(device),
+                    edge_index=edge_index_t,
+                    edge_type=edge_type_t,
+                    node_type=node_type_t,
+                    channel_llr=prior_llr_t.clone(),
+                )
+                data_obj.p_value = torch.tensor(p_val, dtype=torch.float32).to(device)
+
+                with torch.no_grad():
+                    gnn_model.eval()
+                    gnn_out = gnn_model(data_obj)
+
+                llr_base = prior_llr_t.clone()
+                if correction_mode == "both":
+                    add_c, mul_c = gnn_out
+                    add_c = torch.clamp(add_c, -20.0, 20.0)
+                    mul_c = torch.clamp(mul_c, -5.0, 5.0)
+                    gnn_out = (add_c, mul_c)
+                else:
+                    gnn_out = torch.clamp(gnn_out, -20.0, 20.0)
+
+                corrections[i] = apply_correction(llr_base, gnn_out, correction_mode).cpu().numpy()
+
+            # Batched BP with corrected LLRs
+            syn_t = torch.from_numpy(syndromes[start:end]).float().to(device)
+            corr_t = torch.from_numpy(corrections).float().to(device)
+
+            with torch.no_grad():
+                _, hard, converged = gnn_dec(syn_t, corr_t)
+
+            hard_np = hard.cpu().numpy()
+            conv_np = converged.cpu().numpy()
+
+            pred_obs = (hard_np @ obs_matrix) % 2
+            obs_actual = observables[start:end].astype(np.int64)
+            n_obs_check = min(pred_obs.shape[1], obs_actual.shape[1])
+            logical_err = np.any(pred_obs[:, :n_obs_check] != obs_actual[:, :n_obs_check], axis=1)
+
+            gnn_logical_all.append(logical_err)
+            gnn_bp_errors += int(logical_err.sum())
+            gnn_bp_converged += int(conv_np.sum())
+
+            if end % max(1, shots // 5) < CHUNK:
+                elapsed = time.time() - t_gnn
+                print(f"  GNN-BP: {end}/{shots} shots ({end / elapsed:.0f} shots/s)")
+
+        print(f"  GNN-BP done: {shots / (time.time() - t_gnn):.0f} shots/s")
+
+    # --- BP-OSD on DEM (per-shot, parallelized) ---
+    if bposd_dem_available:
+        import concurrent.futures
+        import os
+
+        print("\nBP-OSD decoding on DEM (parallel)...")
+        t_bposd = time.time()
+        n_workers = max(1, os.cpu_count() - 1)
+
+        def _bposd_shot(idx):
+            det_row = syndromes[idx].astype(np.int64)
             pred_obs_bposd, conv_bposd = run_dem_bposd_decoder(
                 det_row, dem_pcm, error_probs, obs_matrix
             )
-            bposd_converged += int(conv_bposd)
-            bposd_logical_err = bool(np.any(
-                pred_obs_bposd[:n_obs_check] != observable[:n_obs_check]
-            ))
-            bposd_errors += int(bposd_logical_err)
+            observable = observables[idx].astype(np.int64)
+            n_obs_check = min(len(pred_obs_bposd), len(observable))
+            logical_err = bool(np.any(pred_obs_bposd[:n_obs_check] != observable[:n_obs_check]))
+            return logical_err, conv_bposd
 
-        if (shot_idx + 1) % max(1, shots // 10) == 0:
-            elapsed = time.time() - t_start
-            rate = (shot_idx + 1) / elapsed
-            print(f"  Processed {shot_idx + 1}/{shots} shots ({rate:.1f} shots/s)")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results_bposd = list(pool.map(_bposd_shot, range(shots)))
+
+        bposd_errors = sum(r[0] for r in results_bposd)
+        bposd_converged = sum(r[1] for r in results_bposd)
+        print(f"  BP-OSD done: {shots / (time.time() - t_bposd):.0f} shots/s ({n_workers} workers)")
 
     elapsed = time.time() - t_start
 
-    # Compute LER with CIs
+    # --- Report results ---
     bp_ler = bp_errors / shots if shots > 0 else 0.0
     bp_ler_low, bp_ler_high = wilson_score_interval_binom(bp_errors, shots)
 
     print(f"\n=== Circuit-Level Results ({elapsed:.1f}s) ===")
-    print(f"BP Decoder (DEM-based):")
+    print(f"BP Decoder (DEM-based, batched):")
     print(f"  Logical Error Rate: {bp_ler:.6f}")
     print(f"  95% CI: [{bp_ler_low:.6f}, {bp_ler_high:.6f}]")
     print(f"  Errors: {bp_errors}/{shots}")
@@ -1118,6 +1744,26 @@ def evaluate_circuit_level(
         },
     }
 
+    if has_gnn:
+        gnn_ler = gnn_bp_errors / shots if shots > 0 else 0.0
+        gnn_ler_low, gnn_ler_high = wilson_score_interval_binom(gnn_bp_errors, shots)
+        improvement = (bp_ler - gnn_ler) / bp_ler if bp_ler > 0 else 0.0
+
+        print(f"\nGNN-BP Decoder (DEM-based, Neural BP={has_neural_bp}):")
+        print(f"  Logical Error Rate: {gnn_ler:.6f}")
+        print(f"  95% CI: [{gnn_ler_low:.6f}, {gnn_ler_high:.6f}]")
+        print(f"  Errors: {gnn_bp_errors}/{shots}")
+        print(f"  Convergence: {gnn_bp_converged}/{shots} ({100*gnn_bp_converged/shots:.1f}%)")
+        print(f"  Improvement over BP: {100*improvement:.1f}%")
+
+        results["gnn_bp_dem"] = {
+            "errors": int(gnn_bp_errors),
+            "ler": float(gnn_ler),
+            "ler_ci_low": float(gnn_ler_low),
+            "ler_ci_high": float(gnn_ler_high),
+            "convergence_rate": float(gnn_bp_converged / shots),
+        }
+
     if bposd_dem_available:
         bposd_ler = bposd_errors / shots if shots > 0 else 0.0
         bposd_ler_low, bposd_ler_high = wilson_score_interval_binom(bposd_errors, shots)
@@ -1139,6 +1785,43 @@ def evaluate_circuit_level(
             "convergence_rate": float(bposd_converged / shots),
         }
 
+    # --- Collect per-shot outcomes for statistical testing ---
+    decoder_outcomes = {"BP (DEM)": bp_logical_arr}
+    if has_gnn and gnn_logical_all:
+        decoder_outcomes["GNN-BP (DEM)"] = np.concatenate(gnn_logical_all)
+    if bposd_dem_available:
+        decoder_outcomes["BP-OSD (DEM)"] = np.array([r[0] for r in results_bposd], dtype=bool)
+
+    stat_tests = pairwise_significance(decoder_outcomes, reference="BP (DEM)")
+    pval_lookup = {t["decoder_b"]: t["p_value"] for t in stat_tests}
+
+    # --- Comparison table ---
+    decoder_table = [("BP (DEM)", bp_ler)]
+    if has_gnn:
+        decoder_table.append(("GNN-BP (DEM)", gnn_ler))
+    if bposd_dem_available:
+        decoder_table.append(("BP-OSD (DEM)", bposd_ler))
+
+    decoder_table.sort(key=lambda x: x[1])
+    print(f"\n{'='*60}")
+    print(f"  Circuit-Level Decoder Comparison (sorted by LER)")
+    print(f"{'='*60}")
+    for rank, (name, ler_val) in enumerate(decoder_table, 1):
+        improv = (bp_ler - ler_val) / bp_ler * 100 if bp_ler > 0 else 0.0
+        tag = " (best)" if rank == 1 else ""
+        pval = pval_lookup.get(name)
+        if pval is not None:
+            sig = "*" if pval < 0.05 else " "
+            pstr = f"  p={pval:.4f}{sig}" if pval >= 0.0001 else f"  p<0.0001*"
+        else:
+            pstr = "  (ref)     "
+        print(f"  {rank}. {name:20s}  LER={ler_val:.6f}  ({improv:+.1f}% vs BP){pstr}{tag}")
+    print(f"{'='*60}")
+    print(f"  McNemar's test vs BP baseline (* = p < 0.05)")
+
+    if stat_tests:
+        results["statistical_tests"] = stat_tests
+
     return results
 
 
@@ -1152,7 +1835,7 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--test_npz", type=str, required=True,
                         help="Path to test data NPZ file")
     parser.add_argument("--gnn_model", type=str, required=False,
-                        help="Path to trained GNN model (code_capacity mode only)")
+                        help="Path to trained GNN model (code_capacity or circuit_level)")
     parser.add_argument("--mode", type=str, default="code_capacity",
                         choices=["code_capacity", "circuit_level"],
                         help="Decoding mode: code_capacity (separate CSS) or circuit_level (DEM)")
@@ -1169,6 +1852,8 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--lsd_method", type=str, default="LSD_CS",
                         choices=["LSD_0", "LSD_E", "LSD_CS"],
                         help="LSD method for BP-LSD decoder")
+    parser.add_argument("--osd_order", type=int, default=0,
+                        help="OSD order for BP-OSD decoder (0=fastest, higher=stronger)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out_dir", type=str, required=True,
                         help="Output directory for results")
@@ -1187,35 +1872,45 @@ def main(argv: List[str] | None = None) -> int:
     npz_data = _load_npz(args.test_npz)
     meta = _parse_meta(npz_data)
 
-    # Load GNN model if provided (code_capacity mode only)
+    # Load GNN model if provided
     gnn_model_inst = None
     gnn_correction_mode = "additive"
+    gnn_checkpoint = None
     if args.gnn_model:
-        if args.mode == "circuit_level":
-            print("Warning: GNN model not supported in circuit_level mode (ignored)")
+        print(f"Loading GNN model from {args.gnn_model}...")
+        checkpoint = torch.load(args.gnn_model, map_location=device, weights_only=True)
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            gnn_checkpoint = checkpoint
+            gnn_correction_mode = checkpoint.get("correction_mode", "additive")
+            gnn_use_film = checkpoint.get("use_film", False)
+            gnn_noise_feat_dim = checkpoint.get("noise_feat_dim", 1)
+            # DEM models use edge_types=1, code-capacity uses edge_types=2
+            gnn_edge_types = checkpoint.get("edge_types", 2)
+            gnn_model_inst = TannerGNN(
+                hidden_dim=checkpoint.get("hidden_dim", 64),
+                num_mp_layers=checkpoint.get("num_mp_layers", 3),
+                edge_types=gnn_edge_types,
+                correction_mode=gnn_correction_mode,
+                use_residual=checkpoint.get("use_residual", False),
+                use_layer_norm=checkpoint.get("use_layer_norm", False),
+                use_attention=checkpoint.get("use_attention", False),
+                use_film=gnn_use_film,
+                noise_feat_dim=gnn_noise_feat_dim,
+                standardize_input=checkpoint.get("standardize_input", False),
+            )
+            gnn_model_inst.load_state_dict(checkpoint["model_state_dict"])
+            ckpt_mode = checkpoint.get("mode", "code_capacity")
+            film_str = f", film={gnn_use_film}" if gnn_use_film else ""
+            print(f"  Loaded checkpoint (mode={ckpt_mode}, hidden_dim={checkpoint.get('hidden_dim', 64)}, "
+                  f"num_mp_layers={checkpoint.get('num_mp_layers', 3)}, "
+                  f"edge_types={gnn_edge_types}, "
+                  f"correction_mode={gnn_correction_mode}, "
+                  f"attention={checkpoint.get('use_attention', False)}{film_str})")
         else:
-            print(f"Loading GNN model from {args.gnn_model}...")
-            checkpoint = torch.load(args.gnn_model, map_location=device, weights_only=True)
-            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-                gnn_correction_mode = checkpoint.get("correction_mode", "additive")
-                gnn_model_inst = TannerGNN(
-                    hidden_dim=checkpoint.get("hidden_dim", 64),
-                    num_mp_layers=checkpoint.get("num_mp_layers", 3),
-                    correction_mode=gnn_correction_mode,
-                    use_residual=checkpoint.get("use_residual", False),
-                    use_layer_norm=checkpoint.get("use_layer_norm", False),
-                    use_attention=checkpoint.get("use_attention", False),
-                )
-                gnn_model_inst.load_state_dict(checkpoint["model_state_dict"])
-                print(f"  Loaded checkpoint (hidden_dim={checkpoint.get('hidden_dim', 64)}, "
-                      f"num_mp_layers={checkpoint.get('num_mp_layers', 3)}, "
-                      f"correction_mode={gnn_correction_mode}, "
-                      f"attention={checkpoint.get('use_attention', False)})")
-            else:
-                gnn_model_inst = TannerGNN()
-                gnn_model_inst.load_state_dict(checkpoint)
-            gnn_model_inst = gnn_model_inst.to(device)
-            gnn_model_inst.eval()
+            gnn_model_inst = TannerGNN()
+            gnn_model_inst.load_state_dict(checkpoint)
+        gnn_model_inst = gnn_model_inst.to(device)
+        gnn_model_inst.eval()
 
     # Run evaluation
     if args.mode == "code_capacity":
@@ -1229,11 +1924,16 @@ def main(argv: List[str] | None = None) -> int:
             correction_mode=gnn_correction_mode,
             lsd_order=args.lsd_order,
             lsd_method=args.lsd_method,
+            osd_order=args.osd_order,
+            checkpoint=gnn_checkpoint,
         )
     elif args.mode == "circuit_level":
         results = evaluate_circuit_level(
             npz_data, meta, device,
             use_bposd=args.bposd,
+            gnn_model=gnn_model_inst,
+            correction_mode=gnn_correction_mode,
+            checkpoint=gnn_checkpoint,
         )
     else:
         print(f"Unknown mode: {args.mode}")

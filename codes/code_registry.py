@@ -22,6 +22,16 @@ CODE_CATALOG: Dict[str, dict] = {
         "B_x_pows": [1, 2],
         "B_y_pows": [3],
     },
+    # Bravyi et al. "two-gross" code: l=12, m=12
+    # A = x^3 + y^2 + y^7,  B = y^3 + x + x^2
+    "288_12_18": {
+        "l": 12,
+        "m": 12,
+        "A_x_pows": [3],
+        "A_y_pows": [2, 7],
+        "B_x_pows": [1, 2],
+        "B_y_pows": [3],
+    },
 }
 
 

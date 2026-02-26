@@ -7,6 +7,7 @@ Loss functions:
     - weighted_bce: binary cross-entropy with pos_weight upweighting errors
     - focal: focal loss that down-weights easy negatives
     - logical_aware: wraps any base loss and adds a soft logical-flip penalty
+    - coset: degeneracy-aware loss using soft syndrome + logical observable check
 """
 from __future__ import annotations
 
@@ -186,3 +187,285 @@ def syndrome_consistency_loss(
     predicted_syn = predicted_syn.clamp(0.0, 1.0)
 
     return F.binary_cross_entropy(predicted_syn, syndrome)
+
+
+def coset_loss(
+    marginals: torch.Tensor,
+    targets: torch.Tensor,
+    syndrome: torch.Tensor,
+    pcm: torch.Tensor,
+    logicals: torch.Tensor,
+    syn_weight: float = 1.0,
+    logical_weight: float = 1.0,
+) -> torch.Tensor:
+    """Degeneracy-aware loss for CSS codes.
+
+    Instead of penalizing per-qubit error mismatch (which punishes degenerate
+    solutions), this loss only penalizes:
+      1. Syndrome mismatch: predicted errors should produce the correct syndrome
+      2. Logical observable mismatch: predicted errors should have correct coset
+
+    Uses |sin(pi*x/2)| as a differentiable modulo-2 operation, following
+    Astra (arXiv:2408.07038) and quaternary NBP (arXiv:2308.08208).
+
+    Args:
+        marginals: (B, n) soft error probabilities from BP
+        targets: (B, n) ground-truth binary error vectors
+        syndrome: (B, m) actual syndrome bits
+        pcm: (m, n) parity-check matrix
+        logicals: (k, n) logical operator matrix
+        syn_weight: weight for syndrome consistency term
+        logical_weight: weight for logical observable term
+    """
+    eps = 1e-7
+    p = marginals.clamp(eps, 1.0 - eps)
+
+    # --- Component 1: Soft syndrome consistency ---
+    # Predicted syndrome from marginals using differentiable XOR formula
+    # P(odd parity over check row) = 0.5 * (1 - prod(1 - 2*p_j))
+    factor = 1.0 - 2.0 * p  # (B, n)
+    log_abs = torch.log(factor.abs().clamp(min=eps))
+    pcm_f = pcm.float()
+
+    log_prod = log_abs @ pcm_f.t()  # (B, m)
+    neg_count = ((factor < 0).float()) @ pcm_f.t()
+    sign_prod = 1.0 - 2.0 * (neg_count % 2)
+
+    predicted_syn = 0.5 * (1.0 - sign_prod * torch.exp(log_prod))
+    predicted_syn = predicted_syn.clamp(0.0, 1.0)
+
+    syn_loss = F.binary_cross_entropy(predicted_syn, syndrome)
+
+    # --- Component 2: Logical observable consistency ---
+    # Ground-truth logical flips: (targets @ logicals.T) mod 2
+    logicals_f = logicals.float()
+    gt_logical = (targets @ logicals_f.t()) % 2  # (B, k)
+
+    # Predicted logical flip probability using XOR formula
+    log_prod_l = log_abs @ logicals_f.t()  # (B, k)
+    neg_count_l = ((factor < 0).float()) @ logicals_f.t()
+    sign_prod_l = 1.0 - 2.0 * (neg_count_l % 2)
+
+    predicted_logical = 0.5 * (1.0 - sign_prod_l * torch.exp(log_prod_l))
+    predicted_logical = predicted_logical.clamp(0.0, 1.0)
+
+    logical_loss = F.binary_cross_entropy(predicted_logical, gt_logical)
+
+    return syn_weight * syn_loss + logical_weight * logical_loss
+
+
+def constraint_loss(
+    marginals: torch.Tensor,
+    syndrome: torch.Tensor,
+    pcm: torch.Tensor,
+    logicals: torch.Tensor,
+    targets: torch.Tensor,
+    syn_weight: float = 1.0,
+    logical_weight: float = 1.0,
+) -> torch.Tensor:
+    """Differentiable mod-2 constraint loss using |sin(pi*x/2)| surrogate.
+
+    Following Astra (arXiv:2408.07038), uses |sin(pi*x/2)| as a smooth,
+    differentiable approximation to (x mod 2). Unlike XOR probability formulas,
+    this operates directly on soft error counts and provides strong gradients
+    near constraint satisfaction.
+
+    Key property: |sin(pi*x/2)| = 0 when x is even, 1 when x is odd,
+    and smoothly interpolates, giving non-zero gradients everywhere.
+
+    Args:
+        marginals: (B, n) soft error probabilities from BP
+        syndrome: (B, m) actual syndrome bits (0 or 1)
+        pcm: (m, n) parity-check matrix
+        logicals: (k, n) logical operator matrix
+        targets: (B, n) ground-truth binary error vectors
+        syn_weight: weight for syndrome constraint term
+        logical_weight: weight for logical observable constraint term
+    """
+    eps = 1e-7
+    p = marginals.clamp(eps, 1.0 - eps)  # (B, n)
+    pcm_f = pcm.float()  # (m, n)
+    logicals_f = logicals.float()  # (k, n)
+
+    # Predicted soft syndrome: sum of marginals per check row
+    soft_syn = p @ pcm_f.t()  # (B, m)
+    # |sin(pi*x/2)| gives 0 for even parity, 1 for odd parity
+    pred_syn = torch.abs(torch.sin(soft_syn * (torch.pi / 2.0)))  # (B, m)
+    syn_loss = F.binary_cross_entropy(pred_syn.clamp(eps, 1.0 - eps), syndrome)
+
+    # Ground-truth logical flips: (targets @ logicals.T) mod 2
+    gt_logical = torch.fmod(torch.round(targets @ logicals_f.t()), 2.0)  # (B, k)
+
+    # Predicted soft logical flips
+    soft_log = p @ logicals_f.t()  # (B, k)
+    pred_log = torch.abs(torch.sin(soft_log * (torch.pi / 2.0)))  # (B, k)
+    log_loss = F.binary_cross_entropy(pred_log.clamp(eps, 1.0 - eps), gt_logical)
+
+    return syn_weight * syn_loss + logical_weight * log_loss
+
+
+def per_iteration_loss(
+    marginals_list: list,
+    targets: torch.Tensor,
+    base_loss_fn,
+    decay: float = 0.8,
+) -> torch.Tensor:
+    """Compute weighted sum of losses at each BP iteration.
+
+    Encourages the GNN to produce corrections that improve decoding
+    at every stage, not just the final iteration. Later iterations
+    get higher weight (geometric decay from first to last).
+
+    Args:
+        marginals_list: list of (B, n) marginals from each BP iteration
+        targets: (B, n) ground-truth binary error vectors
+        base_loss_fn: callable(marginals, targets) -> scalar loss
+        decay: geometric weight factor; final iteration gets weight 1.0,
+               second-to-last gets decay, etc.
+    """
+    T = len(marginals_list)
+    if T == 0:
+        return torch.tensor(0.0, device=targets.device, dtype=targets.dtype,
+                            requires_grad=True)
+
+    total = torch.tensor(0.0, device=marginals_list[0].device)
+    weight_sum = 0.0
+    for t, marg in enumerate(marginals_list):
+        w = decay ** (T - 1 - t)  # last iteration gets weight 1.0
+        total = total + w * base_loss_fn(marg, targets)
+        weight_sum += w
+
+    return total / weight_sum
+
+
+def observable_loss(
+    marginals: torch.Tensor,
+    obs_matrix: torch.Tensor,
+    true_obs: torch.Tensor,
+    syndrome: torch.Tensor,
+    dem_pcm: torch.Tensor,
+    syn_weight: float = 1.0,
+    obs_weight: float = 1.0,
+) -> torch.Tensor:
+    """Circuit-level loss: penalizes wrong observables and syndrome mismatch.
+
+    For circuit-level decoding, we don't have ground-truth fault patterns.
+    Instead we use:
+      1. Observable loss: predicted observable flips should match actual
+      2. Syndrome loss: predicted faults should explain detector events
+
+    Uses the XOR probability formula for differentiable mod-2:
+        P(odd parity) = 0.5 * (1 - prod(1 - 2*p_i))
+
+    Args:
+        marginals: (B, num_errors) soft fault probabilities from BP
+        obs_matrix: (num_errors, num_observables) which observables each fault flips
+        true_obs: (B, num_observables) actual observable outcomes
+        syndrome: (B, num_detectors) detector events
+        dem_pcm: (num_detectors, num_errors) DEM parity-check matrix
+        syn_weight: weight for syndrome consistency term
+        obs_weight: weight for observable prediction term
+    """
+    eps = 1e-7
+    p = marginals.clamp(eps, 1.0 - eps)  # (B, E)
+    factor = 1.0 - 2.0 * p  # (B, E)
+    log_abs = torch.log(factor.abs().clamp(min=eps))  # (B, E)
+
+    # --- Observable loss ---
+    # For each observable k, compute P(flip) over faults in obs_matrix[:, k]
+    obs_f = obs_matrix.float()  # (E, num_obs)
+    log_prod_obs = log_abs @ obs_f  # (B, num_obs)
+    neg_count_obs = ((factor < 0).float()) @ obs_f
+    sign_prod_obs = 1.0 - 2.0 * (neg_count_obs % 2)
+
+    pred_obs = 0.5 * (1.0 - sign_prod_obs * torch.exp(log_prod_obs))
+    pred_obs = pred_obs.clamp(0.0, 1.0)  # (B, num_obs)
+
+    obs_loss = F.binary_cross_entropy(pred_obs, true_obs)
+
+    # --- Syndrome consistency loss ---
+    # Predicted detector events from marginals
+    pcm_f = dem_pcm.float()  # (D, E)
+    log_prod_syn = log_abs @ pcm_f.t()  # (B, D)
+    neg_count_syn = ((factor < 0).float()) @ pcm_f.t()
+    sign_prod_syn = 1.0 - 2.0 * (neg_count_syn % 2)
+
+    pred_syn = 0.5 * (1.0 - sign_prod_syn * torch.exp(log_prod_syn))
+    pred_syn = pred_syn.clamp(0.0, 1.0)  # (B, D)
+
+    syn_loss = F.binary_cross_entropy(pred_syn, syndrome)
+
+    return obs_weight * obs_loss + syn_weight * syn_loss
+
+
+def observable_loss_decomposed(
+    marginals: torch.Tensor,
+    obs_matrix: torch.Tensor,
+    true_obs: torch.Tensor,
+    syndrome: torch.Tensor,
+    dem_pcm: torch.Tensor,
+    syn_weight: float = 1.0,
+    obs_weight: float = 1.0,
+    obs_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Circuit-level loss with per-observable decomposition.
+
+    Like ``observable_loss`` but returns both the total loss and the
+    per-observable loss vector so that the training loop can:
+      - Log per-observable losses for diagnostics
+      - Dynamically weight harder observables higher
+
+    Args:
+        marginals: (B, num_errors) soft fault probabilities from BP
+        obs_matrix: (num_errors, num_observables) which observables each fault flips
+        true_obs: (B, num_observables) actual observable outcomes
+        syndrome: (B, num_detectors) detector events
+        dem_pcm: (num_detectors, num_errors) DEM parity-check matrix
+        syn_weight: weight for syndrome consistency term
+        obs_weight: weight for observable prediction term
+        obs_weights: optional (num_observables,) per-observable weights.
+            If *None*, all observables are weighted equally.
+
+    Returns:
+        (total_loss, per_obs_losses):
+            total_loss: scalar combined loss
+            per_obs_losses: (num_observables,) detached per-observable BCE losses
+    """
+    eps = 1e-7
+    p = marginals.clamp(eps, 1.0 - eps)
+    factor = 1.0 - 2.0 * p
+    log_abs = torch.log(factor.abs().clamp(min=eps))
+
+    # --- Per-observable loss ---
+    obs_f = obs_matrix.float()
+    log_prod_obs = log_abs @ obs_f
+    neg_count_obs = ((factor < 0).float()) @ obs_f
+    sign_prod_obs = 1.0 - 2.0 * (neg_count_obs % 2)
+
+    pred_obs = 0.5 * (1.0 - sign_prod_obs * torch.exp(log_prod_obs))
+    pred_obs = pred_obs.clamp(eps, 1.0 - eps)  # (B, num_obs)
+
+    num_obs = true_obs.shape[1]
+    per_obs = torch.stack([
+        F.binary_cross_entropy(pred_obs[:, k], true_obs[:, k])
+        for k in range(num_obs)
+    ])  # (num_obs,)
+
+    if obs_weights is not None:
+        weighted_obs_loss = (per_obs * obs_weights).sum() / obs_weights.sum().clamp(min=eps)
+    else:
+        weighted_obs_loss = per_obs.mean()
+
+    # --- Syndrome consistency loss ---
+    pcm_f = dem_pcm.float()
+    log_prod_syn = log_abs @ pcm_f.t()
+    neg_count_syn = ((factor < 0).float()) @ pcm_f.t()
+    sign_prod_syn = 1.0 - 2.0 * (neg_count_syn % 2)
+
+    pred_syn = 0.5 * (1.0 - sign_prod_syn * torch.exp(log_prod_syn))
+    pred_syn = pred_syn.clamp(eps, 1.0 - eps)
+
+    syn_loss = F.binary_cross_entropy(pred_syn, syndrome)
+
+    total = obs_weight * weighted_obs_loss + syn_weight * syn_loss
+    return total, per_obs.detach()

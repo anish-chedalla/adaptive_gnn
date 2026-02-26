@@ -93,6 +93,79 @@ def run_css_bposd_decoder(
     return z_errors.astype(np.int64), x_errors.astype(np.int64)
 
 
+def run_css_bposd_with_llr(
+    x_syndrome: np.ndarray,
+    z_syndrome: np.ndarray,
+    hx: np.ndarray,
+    hz: np.ndarray,
+    per_qubit_llr_z: np.ndarray,
+    per_qubit_llr_x: np.ndarray,
+    max_iter: int = 100,
+    osd_order: int = 0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Run CSS BP-OSD with per-qubit LLRs (for GNN + BP-OSD combination).
+
+    Instead of a uniform error_rate, uses per-qubit error probabilities
+    derived from GNN-corrected LLRs.
+
+    Args:
+        x_syndrome: (mx,) X-check syndrome
+        z_syndrome: (mz,) Z-check syndrome
+        hx: (mx, n) X parity check matrix
+        hz: (mz, n) Z parity check matrix
+        per_qubit_llr_z: (n,) per-qubit LLR for Z-errors (from GNN correction)
+        per_qubit_llr_x: (n,) per-qubit LLR for X-errors (from GNN correction)
+        max_iter: maximum BP iterations
+        osd_order: OSD order (0 = fastest)
+
+    Returns:
+        (z_errors, x_errors) as numpy arrays of shape (n,)
+    """
+    n = hx.shape[1]
+
+    # Convert LLRs to error probabilities: p = sigmoid(-LLR) = 1 / (1 + exp(LLR))
+    def _llr_to_prob(llr):
+        llr = np.clip(llr, -20.0, 20.0)
+        return 1.0 / (1.0 + np.exp(llr))
+
+    prob_z = np.clip(_llr_to_prob(per_qubit_llr_z), 1e-7, 1.0 - 1e-7).astype(np.float64)
+    prob_x = np.clip(_llr_to_prob(per_qubit_llr_x), 1e-7, 1.0 - 1e-7).astype(np.float64)
+
+    osd_method = "osd0" if osd_order == 0 else "osd_cs"
+
+    # Decode Z-errors using hx with per-qubit error channel
+    if x_syndrome.sum() > 0:
+        dec_z = BpOsdDecoder(
+            hx,
+            error_channel=prob_z.tolist(),
+            bp_method="ms",
+            max_iter=max_iter,
+            osd_method=osd_method,
+            osd_order=osd_order,
+            ms_scaling_factor=0.75,
+        )
+        z_errors = dec_z.decode(x_syndrome.astype(np.int32))
+    else:
+        z_errors = np.zeros(n, dtype=np.int64)
+
+    # Decode X-errors using hz with per-qubit error channel
+    if z_syndrome.sum() > 0:
+        dec_x = BpOsdDecoder(
+            hz,
+            error_channel=prob_x.tolist(),
+            bp_method="ms",
+            max_iter=max_iter,
+            osd_method=osd_method,
+            osd_order=osd_order,
+            ms_scaling_factor=0.75,
+        )
+        x_errors = dec_x.decode(z_syndrome.astype(np.int32))
+    else:
+        x_errors = np.zeros(n, dtype=np.int64)
+
+    return z_errors.astype(np.int64), x_errors.astype(np.int64)
+
+
 def run_dem_bposd_decoder(
     detectors: np.ndarray,
     dem_pcm: np.ndarray,
@@ -124,14 +197,14 @@ def run_dem_bposd_decoder(
 
     osd_method = "osd0" if osd_order == 0 else "osd_cs"
 
-    # Use median error probability as the error_rate for BP-OSD
-    # (BP-OSD takes a single error_rate, not per-variable LLRs)
-    median_prob = float(np.median(error_probs))
+    # Use per-variable error probabilities for accurate BP priors
+    # DEM error probs span orders of magnitude — a single scalar is inadequate
+    error_channel = np.clip(error_probs, 1e-10, 1.0 - 1e-10).astype(np.float64)
 
     # BP-OSD expects PCM with rows = checks (detectors), cols = variables (errors)
     decoder = BpOsdDecoder(
         dem_pcm,
-        error_rate=median_prob,
+        error_channel=list(error_channel),
         bp_method="ms",
         max_iter=max_iter,
         osd_method=osd_method,
