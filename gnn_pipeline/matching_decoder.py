@@ -71,7 +71,9 @@ def _decompose_pcm_for_matching(pcm, weights):
     # Add boundary edges: one weight-1 column per check node.
     # These connect each check to a virtual boundary, allowing
     # matching when syndrome has odd parity in a component.
-    boundary_weight = 100.0  # high cost discourages spurious boundary matches
+    # Scale boundary weight relative to mean edge weight to stay robust
+    # across different noise regimes.
+    boundary_weight = max(100.0, 10.0 * np.mean(new_weights)) if new_weights else 100.0
     for row in range(m):
         boundary_col = np.zeros(m, dtype=np.uint8)
         boundary_col[row] = 1

@@ -139,6 +139,16 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--bp_iters", type=int, default=10)
     parser.add_argument("--neural_bp", action="store_true")
 
+    # Interleaved training (GNN sees BP mid-state)
+    parser.add_argument("--interleaved_train", action="store_true",
+                        help="Train with interleaved GNN-BP: BP stage1 -> GNN correction -> BP stage2")
+    parser.add_argument("--stage1_iters", type=int, default=10,
+                        help="BP iterations before GNN correction (interleaved mode)")
+    parser.add_argument("--stage2_iters", type=int, default=10,
+                        help="BP iterations after GNN correction (interleaved mode)")
+    parser.add_argument("--node_feat_dim", type=int, default=4,
+                        help="Node feature dimension (5 to include BP mid-marginals)")
+
     # Training
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -288,11 +298,16 @@ def main(argv: List[str] | None = None) -> int:
             lz_t = torch.from_numpy(code_data["lz"].astype(np.float32)).to(device)
 
         # Build BP decoders
+        bp_max_iter = args.bp_iters
+        if args.interleaved_train:
+            bp_max_iter = args.stage1_iters + args.stage2_iters
+            print(f"Interleaved training: stage1={args.stage1_iters}, stage2={args.stage2_iters}, "
+                  f"total BP iters={bp_max_iter}, node_feat_dim={args.node_feat_dim}")
         dec_z = MinSumBPDecoder(
-            hx, max_iter=args.bp_iters, alpha=0.8, neural_bp=args.neural_bp
+            hx, max_iter=bp_max_iter, alpha=0.8, neural_bp=args.neural_bp
         ).to(device)
         dec_x = MinSumBPDecoder(
-            hz, max_iter=args.bp_iters, alpha=0.8, neural_bp=args.neural_bp
+            hz, max_iter=bp_max_iter, alpha=0.8, neural_bp=args.neural_bp
         ).to(device)
 
     elif args.mode == "circuit_level":
@@ -327,7 +342,7 @@ def main(argv: List[str] | None = None) -> int:
 
     # --- Build GNN ---
     gnn = TannerGNN(
-        node_feat_dim=4,
+        node_feat_dim=args.node_feat_dim,
         hidden_dim=args.hidden_dim,
         num_mp_layers=args.num_mp_layers,
         edge_types=edge_types,
@@ -448,18 +463,9 @@ def main(argv: List[str] | None = None) -> int:
                     setattr(batch, syn_key, noisy_syn)
 
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                gnn_out = gnn(batch)
 
                 if args.mode == "code_capacity":
                     n_checks = mx + mz
-                    if args.correction_mode == "both":
-                        add_c, mul_c = gnn_out
-                        add_c = torch.clamp(add_c, -20.0, 20.0).view(B, n_qubits)
-                        mul_c = torch.clamp(mul_c, -5.0, 5.0).view(B, n_qubits)
-                        gnn_out = (add_c, mul_c)
-                    else:
-                        gnn_out = torch.clamp(gnn_out, -20.0, 20.0).view(B, n_qubits)
-
                     llr_z = batch.channel_llr_z.view(B, n_qubits)
                     llr_x = batch.channel_llr_x.view(B, n_qubits)
                     z_err = batch.z_error.view(B, n_qubits)
@@ -468,11 +474,62 @@ def main(argv: List[str] | None = None) -> int:
                     x_syn = target_syn[:, :mx]
                     z_syn = target_syn[:, mx:]
 
-                    corr_z = apply_correction(llr_z, gnn_out, args.correction_mode)
-                    corr_x = apply_correction(llr_x, gnn_out, args.correction_mode)
+                    if args.interleaved_train:
+                        # Interleaved: BP stage1 -> GNN mid-correction -> BP stage2
+                        # Uses forward_stages with correction_fn that runs GNN between stages
+                        num_nodes_per = batch.x.shape[0] // B
+                        batch_x_orig = batch.x.clone()
 
-                    marg_z, _, conv_z = dec_z(x_syn, corr_z)
-                    marg_x, _, conv_x = dec_x(z_syn, corr_x)
+                        def _train_correction_fn(mid_marginals, current_llr, stage_idx):
+                            # Optionally inject mid_marginals as 5th feature
+                            if args.node_feat_dim == 5:
+                                x_new = torch.zeros(B * num_nodes_per, 5,
+                                                    device=device, dtype=batch_x_orig.dtype)
+                                x_new[:, :4] = batch_x_orig[:, :4]
+                                for bi in range(B):
+                                    off = bi * num_nodes_per
+                                    x_new[off:off + n_qubits, 4] = mid_marginals[bi]
+                                batch.x = x_new
+                            else:
+                                batch.x = batch_x_orig
+
+                            gnn_out_inter = gnn(batch)
+                            if args.correction_mode == "both":
+                                add_c, mul_c = gnn_out_inter
+                                add_c = torch.clamp(add_c, -20.0, 20.0).view(B, n_qubits)
+                                mul_c = torch.clamp(mul_c, -5.0, 5.0).view(B, n_qubits)
+                                gnn_out_inter = (add_c, mul_c)
+                            else:
+                                gnn_out_inter = torch.clamp(gnn_out_inter, -20.0, 20.0).view(B, n_qubits)
+
+                            return apply_correction(current_llr, gnn_out_inter, args.correction_mode)
+
+                        stage_list = [args.stage1_iters, args.stage2_iters]
+                        marg_z, _, conv_z = dec_z.forward_stages(
+                            x_syn, llr_z, stage_iters=stage_list,
+                            correction_fn=_train_correction_fn,
+                        )
+                        marg_x, _, conv_x = dec_x.forward_stages(
+                            z_syn, llr_x, stage_iters=stage_list,
+                            correction_fn=_train_correction_fn,
+                        )
+
+                    else:
+                        # Standard: GNN -> corrections -> full BP
+                        gnn_out = gnn(batch)
+                        if args.correction_mode == "both":
+                            add_c, mul_c = gnn_out
+                            add_c = torch.clamp(add_c, -20.0, 20.0).view(B, n_qubits)
+                            mul_c = torch.clamp(mul_c, -5.0, 5.0).view(B, n_qubits)
+                            gnn_out = (add_c, mul_c)
+                        else:
+                            gnn_out = torch.clamp(gnn_out, -20.0, 20.0).view(B, n_qubits)
+
+                        corr_z = apply_correction(llr_z, gnn_out, args.correction_mode)
+                        corr_x = apply_correction(llr_x, gnn_out, args.correction_mode)
+
+                        marg_z, _, conv_z = dec_z(x_syn, corr_z)
+                        marg_x, _, conv_x = dec_x(z_syn, corr_x)
 
                     loss = _compute_code_capacity_loss(
                         marg_z, marg_x, z_err, x_err,
@@ -665,6 +722,10 @@ def main(argv: List[str] | None = None) -> int:
                 "neural_bp": args.neural_bp,
                 "bp_iters": args.bp_iters,
                 "edge_types": edge_types,
+                "node_feat_dim": args.node_feat_dim,
+                "interleaved_train": args.interleaved_train,
+                "stage1_iters": args.stage1_iters if args.interleaved_train else None,
+                "stage2_iters": args.stage2_iters if args.interleaved_train else None,
             }
             if args.neural_bp:
                 ckpt["dec_z_state_dict"] = dec_z.state_dict()

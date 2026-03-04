@@ -1,0 +1,72 @@
+{
+  "description": "Component ablation grid for paper Table 1. Tests contribution of each pipeline component.",
+  "note": "Run with: python -m gnn_pipeline.ablation --grid_json configs/component_ablation.json --train_data 'data/big288_train_*.npz' --test_data data/big288_test_p04.npz --epochs 15 --out_dir runs/ablation_components",
+  "configs": [
+    {
+      "name": "01_plain_bp",
+      "description": "Plain BP baseline (no GNN, no neural BP)",
+      "eval_only": true,
+      "comment": "Run evaluate.py without --gnn_model to get plain BP baseline"
+    },
+    {
+      "name": "02_neural_bp",
+      "description": "+Neural BP (learnable per-iteration weights)",
+      "hidden_dim": 64,
+      "num_mp_layers": 3,
+      "bp_iters": 10,
+      "loss": "focal",
+      "neural_bp": true,
+      "use_film": false,
+      "correction_mode": "additive"
+    },
+    {
+      "name": "03_gnn_bp",
+      "description": "+GNN correction (one-shot, no FiLM)",
+      "hidden_dim": 64,
+      "num_mp_layers": 3,
+      "bp_iters": 10,
+      "loss": "focal",
+      "neural_bp": true,
+      "use_film": false,
+      "correction_mode": "additive"
+    },
+    {
+      "name": "04_gnn_film",
+      "description": "+FiLM conditioning (noise-adaptive GNN)",
+      "hidden_dim": 64,
+      "num_mp_layers": 3,
+      "bp_iters": 10,
+      "loss": "focal",
+      "neural_bp": true,
+      "use_film": true,
+      "correction_mode": "additive"
+    },
+    {
+      "name": "05_gnn_film_both",
+      "description": "+Both correction mode (additive + multiplicative)",
+      "hidden_dim": 64,
+      "num_mp_layers": 3,
+      "bp_iters": 10,
+      "loss": "focal",
+      "neural_bp": true,
+      "use_film": true,
+      "correction_mode": "both"
+    },
+    {
+      "name": "06_interleaved",
+      "description": "+Interleaved GNN-BP (GNN corrects mid-BP)",
+      "hidden_dim": 64,
+      "num_mp_layers": 3,
+      "bp_iters": 10,
+      "loss": "focal",
+      "neural_bp": true,
+      "use_film": true,
+      "correction_mode": "additive",
+      "comment": "Same model as 04, evaluated with interleaved mode"
+    }
+  ],
+  "eval_flags": {
+    "all": "--bposd --bplsd",
+    "comment": "All configs evaluated with BP-OSD and BP-LSD to show +OSD/LSD contribution"
+  }
+}

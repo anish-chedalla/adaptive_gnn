@@ -3,26 +3,21 @@
 Automates training + evaluation across multiple configurations,
 collects results, and outputs a CSV comparison table.
 
+Supports two JSON formats:
+  1. Grid format: {"hidden_dim": [64, 128], "loss": ["mse", "focal"], ...}
+     Creates Cartesian product of all parameter combinations.
+  2. Named configs format: {"configs": [{"name": "...", "hidden_dim": 64, ...}, ...]}
+     Each config is an explicit named configuration (for component ablation).
+
 Usage:
     # Default ablation grid
-    python -m gnn_pipeline.ablation \
-        --train_data "data/supervised_train.npz" \
-        --test_data "data/supervised_test.npz" \
-        --pretrained runs/drift_train/best_model.pt \
-        --epochs 10 --out_dir runs/ablation
+    python -m gnn_pipeline.ablation --train_data "data/*.npz" --test_data data/test.npz --epochs 10 --out_dir runs/ablation
 
-    # Custom grid via JSON
-    python -m gnn_pipeline.ablation \
-        --train_data "data/supervised_train.npz" \
-        --test_data "data/supervised_test.npz" \
-        --grid_json ablation_grid.json \
-        --epochs 10 --out_dir runs/ablation
+    # Component ablation via named configs
+    python -m gnn_pipeline.ablation --grid_json configs/component_ablation.json --train_data "data/*.npz" --test_data data/test.npz --epochs 15 --out_dir runs/ablation
 
     # Evaluate-only (skip training, read existing results)
-    python -m gnn_pipeline.ablation \
-        --train_data "data/supervised_train.npz" \
-        --test_data "data/supervised_test.npz" \
-        --out_dir runs/ablation --eval_only
+    python -m gnn_pipeline.ablation --train_data "data/*.npz" --test_data data/test.npz --out_dir runs/ablation --eval_only
 """
 from __future__ import annotations
 
@@ -45,8 +40,8 @@ DEFAULT_GRID = {
 }
 
 
-def _build_configs(grid: dict, use_pretrained: bool) -> list:
-    """Generate all config combinations from the grid."""
+def _build_configs_from_grid(grid: dict, use_pretrained: bool) -> list:
+    """Generate all config combinations from a grid-format dict."""
     keys = sorted(grid.keys())
     values = [grid[k] for k in keys]
     configs = []
@@ -58,9 +53,7 @@ def _build_configs(grid: dict, use_pretrained: bool) -> list:
             cfg["pretrained"] = False
         configs.append(cfg)
 
-    # Optionally add from-scratch variants for comparison
     if use_pretrained:
-        # Add one from-scratch baseline per loss function
         for loss in grid.get("loss", ["mse"]):
             cfg = {
                 "hidden_dim": grid.get("hidden_dim", [64])[0],
@@ -74,13 +67,41 @@ def _build_configs(grid: dict, use_pretrained: bool) -> list:
     return configs
 
 
+def _build_configs_from_named(named_configs: list) -> tuple:
+    """Parse named configs format (component ablation).
+
+    Returns (configs, config_names) where each config has all needed keys
+    with sensible defaults filled in.
+    """
+    configs = []
+    names = []
+    for cfg_raw in named_configs:
+        cfg = {
+            "hidden_dim": cfg_raw.get("hidden_dim", 64),
+            "num_mp_layers": cfg_raw.get("num_mp_layers", 3),
+            "bp_iters": cfg_raw.get("bp_iters", 10),
+            "loss": cfg_raw.get("loss", "focal"),
+            "correction_mode": cfg_raw.get("correction_mode", "additive"),
+            "neural_bp": cfg_raw.get("neural_bp", False),
+            "use_film": cfg_raw.get("use_film", False),
+            "use_residual": cfg_raw.get("use_residual", False),
+            "use_layer_norm": cfg_raw.get("use_layer_norm", False),
+            "use_attention": cfg_raw.get("use_attention", False),
+            "eval_only": cfg_raw.get("eval_only", False),
+            "description": cfg_raw.get("description", ""),
+        }
+        configs.append(cfg)
+        names.append(cfg_raw.get("name", f"config_{len(configs):02d}"))
+    return configs, names
+
+
 def _config_name(idx: int, cfg: dict) -> str:
-    """Generate a short name for a config."""
+    """Generate a short name for a grid-format config."""
     parts = [f"h{cfg['hidden_dim']}", f"l{cfg['num_mp_layers']}",
              f"bp{cfg['bp_iters']}", cfg["loss"]]
     cm = cfg.get("correction_mode", "additive")
     if cm != "additive":
-        parts.append(cm[:3])  # mul or bot
+        parts.append(cm[:3])
     if cfg.get("pretrained"):
         parts.append("pt")
     else:
@@ -98,12 +119,13 @@ def _run_training(
     lr: float,
     out_dir: pathlib.Path,
 ) -> bool:
-    """Run training for one config as a subprocess."""
+    """Run training for one config as a subprocess using train_unified."""
     run_dir = out_dir / config_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [
-        sys.executable, "-m", "gnn_pipeline.train_supervised",
+        sys.executable, "-m", "gnn_pipeline.train_unified",
+        "--mode", "code_capacity",
         "--in_glob", train_data,
         "--hidden_dim", str(cfg["hidden_dim"]),
         "--num_mp_layers", str(cfg["num_mp_layers"]),
@@ -117,20 +139,81 @@ def _run_training(
         "--out_dir", str(run_dir),
     ]
 
+    # Boolean flags
+    if cfg.get("neural_bp"):
+        cmd.append("--neural_bp")
+    if cfg.get("use_film"):
+        cmd.append("--use_film")
+    if cfg.get("use_residual"):
+        cmd.append("--use_residual")
+    if cfg.get("use_layer_norm"):
+        cmd.append("--use_layer_norm")
+    if cfg.get("use_attention"):
+        cmd.append("--use_attention")
+
+    # AMP for GPU
+    cmd.append("--amp")
+
+    # Pretrained model
     if cfg.get("pretrained") and pretrained_path:
         cmd.extend(["--pretrained", pretrained_path])
-    else:
-        cmd.append("--from_scratch")
-
-    # Add loss-specific args
-    if cfg["loss"] == "weighted_bce":
-        cmd.extend(["--pos_weight", "50"])
-    elif cfg["loss"] == "focal":
-        cmd.extend(["--focal_alpha", "0.25", "--focal_gamma", "2.0"])
 
     print(f"  CMD: {' '.join(cmd)}")
 
     log_path = run_dir / "train_log.txt"
+    try:
+        with open(log_path, "w") as log_f:
+            result = subprocess.run(
+                cmd, stdout=log_f, stderr=subprocess.STDOUT,
+                timeout=7200, cwd=str(out_dir.parent),
+            )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        print(f"  TIMEOUT after 7200s")
+        return False
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        return False
+
+
+def _run_evaluation(
+    config_name: str,
+    test_data: str,
+    out_dir: pathlib.Path,
+    use_bposd: bool = False,
+    use_mwpm: bool = False,
+    use_bplsd: bool = False,
+    eval_only_bp: bool = False,
+) -> bool:
+    """Run evaluation for one config."""
+    run_dir = out_dir / config_name
+    eval_dir = run_dir / "eval"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable, "-m", "gnn_pipeline.evaluate",
+        "--test_npz", test_data,
+        "--out_dir", str(eval_dir),
+    ]
+
+    # eval_only configs (plain BP baseline) have no model
+    if not eval_only_bp:
+        model_path = run_dir / "best_checkpoint.pt"
+        if not model_path.exists():
+            model_path = run_dir / "best_model.pt"
+        if not model_path.exists():
+            print(f"  No model at {run_dir}, skipping evaluation")
+            return False
+        cmd.extend(["--gnn_model", str(model_path)])
+
+    if use_bposd:
+        cmd.append("--bposd")
+    if use_mwpm:
+        cmd.append("--mwpm")
+    if use_bplsd:
+        cmd.append("--bplsd")
+
+    log_path = run_dir / "eval_log.txt"
     try:
         with open(log_path, "w") as log_f:
             result = subprocess.run(
@@ -146,63 +229,13 @@ def _run_training(
         return False
 
 
-def _run_evaluation(
-    config_name: str,
-    test_data: str,
-    out_dir: pathlib.Path,
-    use_bposd: bool = False,
-    use_mwpm: bool = False,
-) -> bool:
-    """Run evaluation for one config."""
-    run_dir = out_dir / config_name
-
-    # Prefer rich checkpoint (has correction_mode metadata)
-    model_path = run_dir / "best_checkpoint.pt"
-    if not model_path.exists():
-        model_path = run_dir / "best_model.pt"
-
-    if not model_path.exists():
-        print(f"  No model at {run_dir}, skipping evaluation")
-        return False
-
-    eval_dir = run_dir / "eval"
-    eval_dir.mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        sys.executable, "-m", "gnn_pipeline.evaluate",
-        "--test_npz", test_data,
-        "--gnn_model", str(model_path),
-        "--out_dir", str(eval_dir),
-    ]
-
-    if use_bposd:
-        cmd.append("--bposd")
-    if use_mwpm:
-        cmd.append("--mwpm")
-
-    log_path = run_dir / "eval_log.txt"
-    try:
-        with open(log_path, "w") as log_f:
-            result = subprocess.run(
-                cmd, stdout=log_f, stderr=subprocess.STDOUT,
-                timeout=1800, cwd=str(out_dir.parent),
-            )
-        return result.returncode == 0
-    except subprocess.TimeoutExpired:
-        print(f"  TIMEOUT after 1800s")
-        return False
-    except Exception as e:
-        print(f"  ERROR: {e}")
-        return False
-
-
 def _collect_results(configs: list, config_names: list, out_dir: pathlib.Path) -> list:
     """Collect results from all completed runs."""
     rows = []
     for cfg, name in zip(configs, config_names):
         run_dir = out_dir / name
 
-        # Read training results (prefer structured JSON over text parsing)
+        # Read training results
         train_loss = None
         val_loss = None
         training_json = run_dir / "training_log.json"
@@ -218,7 +251,7 @@ def _collect_results(configs: list, config_names: list, out_dir: pathlib.Path) -
             except (json.JSONDecodeError, KeyError, TypeError):
                 pass
 
-        # Fallback: parse train_log.txt if JSON not available
+        # Fallback: parse train_log.txt
         if train_loss is None or val_loss is None:
             train_log = run_dir / "train_log.txt"
             if train_log.exists():
@@ -241,6 +274,7 @@ def _collect_results(configs: list, config_names: list, out_dir: pathlib.Path) -
         gnn_bp_ler = None
         improvement = None
         bposd_ler = None
+        bplsd_ler = None
         mwpm_ler = None
 
         if eval_results_path.exists():
@@ -250,22 +284,26 @@ def _collect_results(configs: list, config_names: list, out_dir: pathlib.Path) -
             gnn_bp_ler = eval_data.get("gnn_bp", {}).get("ler")
             improvement = eval_data.get("improvement_pct")
             bposd_ler = eval_data.get("bposd", {}).get("ler")
+            bplsd_ler = eval_data.get("bplsd", {}).get("ler")
             mwpm_ler = eval_data.get("mwpm", {}).get("ler")
 
         row = {
             "config": name,
-            "hidden_dim": cfg["hidden_dim"],
-            "num_mp_layers": cfg["num_mp_layers"],
-            "bp_iters": cfg["bp_iters"],
-            "loss": cfg["loss"],
+            "description": cfg.get("description", ""),
+            "hidden_dim": cfg.get("hidden_dim", ""),
+            "num_mp_layers": cfg.get("num_mp_layers", ""),
+            "bp_iters": cfg.get("bp_iters", ""),
+            "loss": cfg.get("loss", ""),
             "correction_mode": cfg.get("correction_mode", "additive"),
-            "pretrained": cfg.get("pretrained", False),
+            "neural_bp": cfg.get("neural_bp", False),
+            "use_film": cfg.get("use_film", False),
             "train_loss": f"{train_loss:.6f}" if train_loss is not None else "N/A",
             "val_loss": f"{val_loss:.6f}" if val_loss is not None else "N/A",
             "bp_ler": f"{bp_ler:.6f}" if bp_ler is not None else "N/A",
             "gnn_bp_ler": f"{gnn_bp_ler:.6f}" if gnn_bp_ler is not None else "N/A",
             "improvement_pct": f"{improvement:.1f}" if improvement is not None else "N/A",
             "bposd_ler": f"{bposd_ler:.6f}" if bposd_ler is not None else "N/A",
+            "bplsd_ler": f"{bplsd_ler:.6f}" if bplsd_ler is not None else "N/A",
             "mwpm_ler": f"{mwpm_ler:.6f}" if mwpm_ler is not None else "N/A",
         }
         rows.append(row)
@@ -279,34 +317,30 @@ def _print_table(rows: list):
         print("No results to display.")
         return
 
-    # Column widths
-    headers = ["config", "hidden", "layers", "bp_iter", "loss", "pretrain",
-               "train_loss", "val_loss", "bp_ler", "gnn_bp_ler", "improv%"]
-    col_widths = [max(len(h), 10) for h in headers]
+    headers = ["config", "description", "bp_ler", "gnn_bp_ler", "improv%",
+               "bposd_ler", "bplsd_ler"]
+    col_widths = [max(len(h), 12) for h in headers]
 
-    # Header
+    # Adjust widths based on data
+    for row in rows:
+        col_widths[0] = max(col_widths[0], len(str(row.get("config", ""))))
+        col_widths[1] = max(col_widths[1], min(len(str(row.get("description", ""))), 40))
+
     header_line = " | ".join(h.center(w) for h, w in zip(headers, col_widths))
     sep_line = "-+-".join("-" * w for w in col_widths)
     print(f"\n{header_line}")
     print(sep_line)
 
-    # Sort by improvement (best first)
-    sorted_rows = sorted(rows, key=lambda r: float(r["improvement_pct"])
-                         if r["improvement_pct"] != "N/A" else -999, reverse=True)
-
-    for row in sorted_rows:
+    for row in rows:
+        desc = str(row.get("description", ""))[:40]
         vals = [
-            row["config"][:col_widths[0]],
-            str(row["hidden_dim"]).center(col_widths[1]),
-            str(row["num_mp_layers"]).center(col_widths[2]),
-            str(row["bp_iters"]).center(col_widths[3]),
-            row["loss"].center(col_widths[4]),
-            str(row["pretrained"]).center(col_widths[5]),
-            row["train_loss"].center(col_widths[6]),
-            row["val_loss"].center(col_widths[7]),
-            row["bp_ler"].center(col_widths[8]),
-            row["gnn_bp_ler"].center(col_widths[9]),
-            row["improvement_pct"].center(col_widths[10]),
+            str(row["config"])[:col_widths[0]],
+            desc.ljust(col_widths[1]),
+            str(row.get("bp_ler", "N/A")).center(col_widths[2]),
+            str(row.get("gnn_bp_ler", "N/A")).center(col_widths[3]),
+            str(row.get("improvement_pct", "N/A")).center(col_widths[4]),
+            str(row.get("bposd_ler", "N/A")).center(col_widths[5]),
+            str(row.get("bplsd_ler", "N/A")).center(col_widths[6]),
         ]
         print(" | ".join(v.ljust(w) for v, w in zip(vals, col_widths)))
 
@@ -329,6 +363,8 @@ def main(argv: List[str] | None = None) -> int:
                         help="Learning rate")
     parser.add_argument("--bposd", action="store_true",
                         help="Include BP-OSD in evaluation")
+    parser.add_argument("--bplsd", action="store_true",
+                        help="Include BP-LSD in evaluation")
     parser.add_argument("--mwpm", action="store_true",
                         help="Include MWPM in evaluation")
     parser.add_argument("--eval_only", action="store_true",
@@ -341,37 +377,51 @@ def main(argv: List[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Load or build grid
+    is_named_format = False
     if args.grid_json:
         with open(args.grid_json) as f:
-            grid = json.load(f)
+            grid_data = json.load(f)
         print(f"Loaded custom grid from {args.grid_json}")
+
+        # Detect format: named configs vs grid
+        if "configs" in grid_data and isinstance(grid_data["configs"], list):
+            is_named_format = True
+            configs, config_names = _build_configs_from_named(grid_data["configs"])
+            print(f"Using named configs format ({len(configs)} configurations)")
+        else:
+            grid = grid_data
+            configs = _build_configs_from_grid(grid, args.pretrained is not None)
+            config_names = [_config_name(i, cfg) for i, cfg in enumerate(configs)]
     else:
         grid = DEFAULT_GRID
         print("Using default ablation grid")
-
-    use_pretrained = args.pretrained is not None
-    configs = _build_configs(grid, use_pretrained)
-    config_names = [_config_name(i, cfg) for i, cfg in enumerate(configs)]
+        configs = _build_configs_from_grid(grid, args.pretrained is not None)
+        config_names = [_config_name(i, cfg) for i, cfg in enumerate(configs)]
 
     print(f"Total configurations: {len(configs)}")
     for i, (cfg, name) in enumerate(zip(configs, config_names)):
-        pt_str = "pretrained" if cfg.get("pretrained") else "scratch"
-        print(f"  [{i}] {name}: hidden={cfg['hidden_dim']}, layers={cfg['num_mp_layers']}, "
-              f"bp={cfg['bp_iters']}, loss={cfg['loss']}, {pt_str}")
+        desc = cfg.get("description", "")
+        skip = " [eval-only]" if cfg.get("eval_only") else ""
+        print(f"  [{i}] {name}: {desc}{skip}")
 
     # Save grid for reproducibility
     grid_path = out_dir / "ablation_grid.json"
     with open(grid_path, "w") as f:
-        json.dump({"grid": grid, "configs": configs, "names": config_names}, f, indent=2)
+        json.dump({"configs": configs, "names": config_names}, f, indent=2)
     print(f"Saved grid to {grid_path}")
 
     if not args.eval_only:
         # Training phase
         t_start = time.time()
         for i, (cfg, name) in enumerate(zip(configs, config_names)):
-            print(f"\n{'='*60}")
-            print(f"[{i+1}/{len(configs)}] Training: {name}")
-            print(f"{'='*60}")
+            # Skip eval-only configs (e.g. plain BP baseline)
+            if cfg.get("eval_only"):
+                print(f"\n[{i+1}/{len(configs)}] {name}: eval-only, skipping training")
+                continue
+
+            print(f"\n[{i+1}/{len(configs)}] Training: {name}")
+            if cfg.get("description"):
+                print(f"  {cfg['description']}")
 
             run_dir = out_dir / name
             if (run_dir / "best_model.pt").exists():
@@ -394,9 +444,7 @@ def main(argv: List[str] | None = None) -> int:
         print(f"\nTraining phase complete: {train_elapsed:.0f}s ({train_elapsed/60:.1f} min)")
 
         # Evaluation phase
-        print(f"\n{'='*60}")
-        print("Evaluation phase")
-        print(f"{'='*60}")
+        print(f"\nEvaluation phase")
 
         for i, (cfg, name) in enumerate(zip(configs, config_names)):
             eval_dir = out_dir / name / "eval"
@@ -404,6 +452,7 @@ def main(argv: List[str] | None = None) -> int:
                 print(f"  [{i+1}/{len(configs)}] {name}: already evaluated, skipping")
                 continue
 
+            is_eval_only_bp = cfg.get("eval_only", False)
             print(f"  [{i+1}/{len(configs)}] Evaluating: {name}")
             success = _run_evaluation(
                 name,
@@ -411,14 +460,14 @@ def main(argv: List[str] | None = None) -> int:
                 out_dir=out_dir,
                 use_bposd=args.bposd,
                 use_mwpm=args.mwpm,
+                use_bplsd=args.bplsd,
+                eval_only_bp=is_eval_only_bp,
             )
             status = "OK" if success else "FAILED"
             print(f"    Eval: {status}")
 
     # Collect results
-    print(f"\n{'='*60}")
-    print("Collecting results")
-    print(f"{'='*60}")
+    print(f"\nCollecting results")
 
     rows = _collect_results(configs, config_names, out_dir)
 
@@ -435,8 +484,8 @@ def main(argv: List[str] | None = None) -> int:
     # Print comparison table
     _print_table(rows)
 
-    # Find best config
-    valid_rows = [r for r in rows if r["improvement_pct"] != "N/A"]
+    # Find best config (by improvement)
+    valid_rows = [r for r in rows if r.get("improvement_pct", "N/A") != "N/A"]
     if valid_rows:
         best = max(valid_rows, key=lambda r: float(r["improvement_pct"]))
         print(f"\nBest config: {best['config']}")

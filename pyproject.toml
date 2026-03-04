@@ -16,10 +16,12 @@ dependencies = [
     "matplotlib>=3.7",
     "pandas>=2.0",
     "ldpc>=2.2.8",
+    "pymatching>=2.3.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov"]
+monitoring = ["tensorboard>=2.0", "wandb>=0.13"]
 
 [tool.setuptools.packages.find]
 include = ["astra_stim*", "codes*", "gnn_pipeline*", "tests*"]

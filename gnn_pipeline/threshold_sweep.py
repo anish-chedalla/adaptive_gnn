@@ -34,6 +34,7 @@ from codes.codes_q import create_bivariate_bicycle_codes
 from codes.code_registry import get_code_params, list_codes
 from gnn_pipeline.evaluate import (
     _check_logical_error,
+    estimate_p_from_syndrome,
     wilson_score_interval_binom,
 )
 from gnn_pipeline.generate_codecap import generate_code_capacity_data
@@ -57,6 +58,7 @@ def _decode_all_shots(
     use_belieffind: bool = False,
     lsd_order: int = 0,
     lsd_method: str = "LSD_CS",
+    use_syndrome_p: bool = False,
 ) -> dict:
     """Decode all shots and return results for each decoder.
 
@@ -135,6 +137,12 @@ def _decode_all_shots(
         edge_type_t = torch.from_numpy(edge_type_np).long().to(device)
         num_nodes = n + mx + mz
 
+        # Syndrome-based noise estimation (for FiLM without oracle p)
+        if use_syndrome_p:
+            syn_p_hat = estimate_p_from_syndrome(all_x_syn, all_z_syn, hx, hz, eta=eta)
+        else:
+            syn_p_hat = None
+
         gnn_hard_z_all = []
         gnn_hard_x_all = []
         gnn_conv_all = []
@@ -157,12 +165,17 @@ def _decode_all_shots(
                 x_feat[n+mx:, 0] = torch.from_numpy(all_z_syn[si]).float()
                 x_feat[n+mx:, 3] = 1.0
 
+                # Use syndrome-estimated p if requested, otherwise oracle p
+                shot_p = float(syn_p_hat[si]) if syn_p_hat is not None else p
+
                 data_obj = Data(
                     x=x_feat.to(device),
                     edge_index=edge_index_t,
                     edge_type=edge_type_t,
                     node_type=node_type_t,
                     channel_llr=torch.full((n,), avg_llr, dtype=torch.float32, device=device),
+                    p_value=torch.tensor([shot_p], dtype=torch.float32, device=device),
+                    batch=torch.zeros(num_nodes, dtype=torch.long, device=device),
                 )
 
                 with torch.no_grad():
@@ -630,6 +643,8 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--lsd_method", type=str, default="LSD_CS",
                         choices=["LSD_0", "LSD_E", "LSD_CS"],
                         help="LSD method for BP-LSD decoder")
+    parser.add_argument("--use_syndrome_p", action="store_true",
+                        help="Use syndrome-estimated noise rate for FiLM instead of oracle p")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
     parser.add_argument("--out_dir", type=str, required=True, help="Output directory")
 
@@ -656,12 +671,15 @@ def main(argv: List[str] | None = None) -> int:
         checkpoint = torch.load(args.gnn_model, map_location=device, weights_only=True)
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
             gnn_model = TannerGNN(
+                node_feat_dim=checkpoint.get("node_feat_dim", 4),
                 hidden_dim=checkpoint.get("hidden_dim", 64),
                 num_mp_layers=checkpoint.get("num_mp_layers", 3),
                 correction_mode=checkpoint.get("correction_mode", "additive"),
                 use_residual=checkpoint.get("use_residual", False),
                 use_layer_norm=checkpoint.get("use_layer_norm", False),
                 use_attention=checkpoint.get("use_attention", False),
+                use_film=checkpoint.get("use_film", False),
+                noise_feat_dim=checkpoint.get("noise_feat_dim", 1),
             )
             gnn_model.load_state_dict(checkpoint["model_state_dict"])
             print(f"  Loaded checkpoint (hidden_dim={checkpoint.get('hidden_dim', 64)}, "
@@ -766,6 +784,7 @@ def main(argv: List[str] | None = None) -> int:
                 use_mwpm=args.mwpm,
                 use_bplsd=args.bplsd, use_belieffind=args.belieffind,
                 lsd_order=args.lsd_order, lsd_method=args.lsd_method,
+                use_syndrome_p=args.use_syndrome_p,
             )
             elapsed = time.time() - t0
 

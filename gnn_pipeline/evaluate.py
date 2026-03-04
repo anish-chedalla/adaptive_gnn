@@ -191,6 +191,60 @@ def wilson_score_interval_binom(
 
 
 # ---------------------------------------------------------------------------
+# Syndrome-Based Noise Estimation
+# ---------------------------------------------------------------------------
+
+def estimate_p_from_syndrome(
+    x_syn: np.ndarray,
+    z_syn: np.ndarray,
+    hx: np.ndarray,
+    hz: np.ndarray,
+    eta: float = 1.0,
+) -> np.ndarray:
+    """Estimate per-shot physical error rate from syndrome weight.
+
+    For a CSS code with biased noise (p_z = p*eta/(eta+1)), each X-check
+    fires with probability 0.5*(1 - (1-2*p_z)^w) where w is the check's
+    row weight. For uniform-weight LDPC codes, we invert this to estimate
+    p from the observed syndrome weight.
+
+    Args:
+        x_syn: (shots, mx) X-syndrome values
+        z_syn: (shots, mz) Z-syndrome values
+        hx: (mx, n) X parity check matrix
+        hz: (mz, n) Z parity check matrix
+        eta: noise bias (Z/X ratio). Default 1.0 (depolarizing).
+
+    Returns:
+        p_hat: (shots,) estimated physical error rate per shot
+    """
+    mx = hx.shape[0]
+    # Use average row weight of Hx (X-checks detect Z-errors, which dominate)
+    row_weights = hx.sum(axis=1)
+    w_avg = float(row_weights.mean())
+
+    # Observed X-syndrome weight per shot
+    x_syn_weight = x_syn.sum(axis=1).astype(np.float64)  # (shots,)
+
+    # Expected: E[weight] = mx * 0.5 * (1 - (1-2*p_z)^w)
+    # Solve for p_z: (1-2*p_z)^w = 1 - 2*weight/mx
+    ratio = np.clip(1.0 - 2.0 * x_syn_weight / mx, -1.0 + 1e-10, 1.0 - 1e-10)
+    # For ratio <= 0 (very noisy), clamp p_z to 0.5
+    pz_hat = np.where(
+        ratio > 0,
+        0.5 * (1.0 - np.power(ratio, 1.0 / w_avg)),
+        0.49,
+    )
+    pz_hat = np.clip(pz_hat, 1e-7, 0.49)
+
+    # Convert p_z back to p: p_z = p * eta/(eta+1)  =>  p = p_z * (eta+1)/eta
+    p_hat = pz_hat * (eta + 1.0) / eta
+    p_hat = np.clip(p_hat, 1e-7, 0.99).astype(np.float32)
+
+    return p_hat
+
+
+# ---------------------------------------------------------------------------
 # Vectorized Batch Construction
 # ---------------------------------------------------------------------------
 
@@ -206,6 +260,7 @@ def _build_eval_batch(
     node_type: torch.Tensor,
     p_vals_chunk: np.ndarray,
     device: torch.device,
+    mid_marginals: Optional[np.ndarray] = None,
 ) -> Batch:
     """Build a batched GNN input without per-sample Python loops.
 
@@ -222,6 +277,8 @@ def _build_eval_batch(
         node_type: (num_nodes,) node types for a single graph
         p_vals_chunk: (B,) per-shot noise estimate
         device: target device
+        mid_marginals: optional (B, n) BP mid-marginals for data qubits
+            (5th feature). If provided, feature dim becomes 5.
 
     Returns:
         ``Batch`` object with all fields set, on ``device``.
@@ -229,15 +286,18 @@ def _build_eval_batch(
     B = all_x_syn_chunk.shape[0]
     num_nodes = n + mx + mz
     E = edge_index.shape[1]
+    feat_dim = 5 if mid_marginals is not None else 4
 
-    # --- Vectorized feature tensor: (B, num_nodes, 4) ---
-    x_3d = torch.zeros(B, num_nodes, 4, dtype=torch.float32)
+    # --- Vectorized feature tensor: (B, num_nodes, feat_dim) ---
+    x_3d = torch.zeros(B, num_nodes, feat_dim, dtype=torch.float32)
     x_3d[:, :n, 0] = avg_llr
     x_3d[:, :n, 1] = 1.0
     x_3d[:, n:n + mx, 0] = torch.from_numpy(all_x_syn_chunk).float()
     x_3d[:, n:n + mx, 2] = 1.0
     x_3d[:, n + mx:, 0] = torch.from_numpy(all_z_syn_chunk).float()
     x_3d[:, n + mx:, 3] = 1.0
+    if mid_marginals is not None:
+        x_3d[:, :n, 4] = torch.from_numpy(mid_marginals).float()
 
     # --- Replicate graph with per-sample offsets ---
     ei_cpu = edge_index.cpu()
@@ -253,7 +313,7 @@ def _build_eval_batch(
     batch_p = torch.from_numpy(p_vals_chunk.astype(np.float32))
 
     batch = Batch(
-        x=x_3d.reshape(-1, 4),
+        x=x_3d.reshape(-1, feat_dim),
         edge_index=batch_ei,
         edge_type=batch_et,
         node_type=batch_nt,
@@ -505,6 +565,7 @@ def evaluate_code_capacity(
     lsd_method: str = "LSD_CS",
     osd_order: int = 0,
     checkpoint: Optional[dict] = None,
+    use_syndrome_p: bool = False,
 ) -> dict:
     """Evaluate decoders in code-capacity mode (separate CSS decoding).
 
@@ -584,6 +645,11 @@ def evaluate_code_capacity(
     all_x_syn = collapsed[:, :mx]   # (shots, mx)
     all_z_syn = collapsed[:, mx:]   # (shots, mz)
 
+    # ---------- Syndrome-based noise estimation (for FiLM without oracle p) ----------
+    syn_p_hat = estimate_p_from_syndrome(all_x_syn, all_z_syn, hx, hz, eta=eta)
+    print(f"Syndrome p-estimate: mean={syn_p_hat.mean():.4f}, "
+          f"range=[{syn_p_hat.min():.4f}, {syn_p_hat.max():.4f}] (true p_base={p})")
+
     # ---------- Batched BP decoding (stale LLR — doesn't know about drift) ----------
     print("\nBatched BP decoding (stale LLR)...")
     t_start = time.time()
@@ -627,6 +693,7 @@ def evaluate_code_capacity(
     bp_converged = int(bp_conv.sum())
 
     bp_elapsed = time.time() - t_start
+    bp_secs = round(bp_elapsed, 2)
     print(f"  BP done: {shots / bp_elapsed:.0f} shots/s")
 
     # ---------- Oracle BP (true per-shot LLR — upper bound) ----------
@@ -673,7 +740,8 @@ def evaluate_code_capacity(
         oracle_logical = _check_logical_errors_batch(oracle_z_errors, oracle_x_errors, lx, lz, observables)
         oracle_bp_errors = int(oracle_logical.sum())
         oracle_bp_converged = int(oracle_conv.sum())
-        print(f"  Oracle BP done: {shots / (time.time() - t_oracle):.0f} shots/s")
+        oracle_secs = round(time.time() - t_oracle, 2)
+        print(f"  Oracle BP done: {shots / oracle_secs:.0f} shots/s")
 
     # ---------- Batched GNN-BP decoding ----------
     gnn_bp_errors = 0
@@ -689,6 +757,7 @@ def evaluate_code_capacity(
 
         # Build Neural BP decoders if checkpoint has trained weights
         ckpt_bp_iters = checkpoint.get("bp_iters", 10) if checkpoint else 10
+        ckpt_node_feat_dim = checkpoint.get("node_feat_dim", 4) if checkpoint else 4
         # Use 100 total iters: first ckpt_bp_iters use learned weights, rest use vanilla BP
         eval_bp_iters = 100
         if has_neural_bp:
@@ -724,7 +793,10 @@ def evaluate_code_capacity(
         avg_llr = (llr_z_stale + llr_x_stale) / 2.0
 
         # Pre-compute p_value array for vectorized batch construction
-        if has_per_shot_p:
+        if use_syndrome_p:
+            p_vals_arr = syn_p_hat  # syndrome-estimated (noise-blind)
+            print("  FiLM p_value: syndrome-estimated (noise-blind mode)")
+        elif has_per_shot_p:
             p_vals_arr = p_vals.astype(np.float32)
         else:
             p_vals_arr = np.full(shots, float(p), dtype=np.float32)
@@ -782,7 +854,8 @@ def evaluate_code_capacity(
         gnn_logical = _check_logical_errors_batch(gnn_z_errors, gnn_x_errors, lx, lz, observables)
         gnn_bp_errors = int(gnn_logical.sum())
         gnn_bp_converged = int(gnn_conv.sum())
-        print(f"  GNN-BP done: {shots / (time.time() - t_gnn):.0f} shots/s")
+        gnn_secs = round(time.time() - t_gnn, 2)
+        print(f"  GNN-BP done: {shots / gnn_secs:.0f} shots/s")
 
     # ---------- Interleaved GNN-BP decoding ----------
     if gnn_model is not None and has_interleaved:
@@ -812,6 +885,10 @@ def evaluate_code_capacity(
         inter_hard_x_all = []
         inter_conv_all = []
 
+        # Storage for interleaved-corrected LLRs (reused by OSD/LSD later)
+        inter_corr_llr_z = np.zeros((shots, n), dtype=np.float32)
+        inter_corr_llr_x = np.zeros((shots, n), dtype=np.float32)
+
         for start in range(0, shots, CHUNK):
             end = min(start + CHUNK, shots)
             B_chunk = end - start
@@ -821,48 +898,45 @@ def evaluate_code_capacity(
             llr_z_t = torch.full((B_chunk, n), llr_z_stale, dtype=torch.float32, device=device)
             llr_x_t = torch.full((B_chunk, n), llr_x_stale, dtype=torch.float32, device=device)
 
-            # Correction function: runs GNN on each sample's current BP state
-            def _make_correction_fn(syn_x_chunk, syn_z_chunk, shot_offset):
+            # Correction function: batched GNN inference on BP mid-state
+            # Also stores corrected LLRs for downstream OSD/LSD
+            avg_llr_inter = (llr_z_stale + llr_x_stale) / 2.0
+            syn_x_np = all_x_syn[start:end]  # numpy (B, mx)
+            syn_z_np = all_z_syn[start:end]  # numpy (B, mz)
+
+            def _make_correction_fn(shot_offset, llr_store):
                 def correction_fn(mid_marginals, current_llr, stage_idx):
-                    """GNN sees current BP marginals and corrects LLRs."""
+                    """Batched GNN correction between BP stages."""
                     B_c = mid_marginals.shape[0]
-                    corrected = current_llr.clone()
-                    for i in range(B_c):
-                        si = shot_offset + i
-                        # Build features with BP marginal as 5th feature
-                        x_feat = torch.zeros(num_nodes, 4, dtype=torch.float32)
-                        avg_llr = (llr_z_stale + llr_x_stale) / 2.0
-                        x_feat[:n, 0] = avg_llr
-                        x_feat[:n, 1] = 1.0
-                        x_feat[n:n+mx, 0] = syn_x_chunk[i]
-                        x_feat[n:n+mx, 2] = 1.0
-                        x_feat[n+mx:, 0] = syn_z_chunk[i]
-                        x_feat[n+mx:, 3] = 1.0
+                    p_chunk = p_vals_arr[shot_offset:shot_offset + B_c]
 
-                        data_obj = Data(
-                            x=x_feat.to(device),
-                            edge_index=edge_index_t,
-                            edge_type=edge_type_t,
-                            node_type=node_type_t,
-                            channel_llr=torch.full((n,), avg_llr, dtype=torch.float32, device=device),
+                    # Check if model expects mid_marginals (node_feat_dim=5)
+                    mm_np = None
+                    if ckpt_node_feat_dim == 5:
+                        mm_np = mid_marginals.detach().cpu().numpy()
+
+                    batch_data = _build_eval_batch(
+                        syn_x_np[:B_c], syn_z_np[:B_c],
+                        avg_llr_inter, n, mx, mz,
+                        edge_index_t, edge_type_t, node_type_t,
+                        p_chunk, device,
+                        mid_marginals=mm_np,
+                    )
+
+                    with torch.no_grad():
+                        gnn_out = gnn_model(batch_data)
+
+                    if correction_mode == "both":
+                        add_c, mul_c = gnn_out
+                        gnn_out_batched = (
+                            torch.clamp(add_c, -20.0, 20.0).view(B_c, n),
+                            torch.clamp(mul_c, -5.0, 5.0).view(B_c, n),
                         )
-                        if has_per_shot_p:
-                            data_obj.p_value = torch.tensor(float(p_vals[si]), dtype=torch.float32).to(device)
-                        else:
-                            data_obj.p_value = torch.tensor(float(p), dtype=torch.float32).to(device)
+                    else:
+                        gnn_out_batched = torch.clamp(gnn_out, -20.0, 20.0).view(B_c, n)
 
-                        with torch.no_grad():
-                            gnn_out = gnn_model(data_obj)
-
-                        if correction_mode == "both":
-                            add_c, mul_c = gnn_out
-                            add_c = torch.clamp(add_c, -20.0, 20.0)
-                            mul_c = torch.clamp(mul_c, -5.0, 5.0)
-                            gnn_out_batched = (add_c.unsqueeze(0), mul_c.unsqueeze(0))
-                        else:
-                            gnn_out_batched = torch.clamp(gnn_out, -20.0, 20.0).unsqueeze(0)
-
-                        corrected[i] = apply_correction(current_llr[i:i+1], gnn_out_batched, correction_mode).squeeze(0)
+                    corrected = apply_correction(current_llr, gnn_out_batched, correction_mode)
+                    llr_store[shot_offset:shot_offset + B_c] = corrected.detach().cpu().numpy()
                     return corrected
                 return correction_fn
 
@@ -872,13 +946,13 @@ def evaluate_code_capacity(
                 _, hard_z, conv_z = inter_dec_z.forward_stages(
                     x_syn_t, llr_z_t,
                     stage_iters=[stage1_iters, stage2_iters],
-                    correction_fn=_make_correction_fn(x_syn_t, z_syn_t, start),
+                    correction_fn=_make_correction_fn(start, inter_corr_llr_z),
                 )
                 # X-errors: hz @ x_error = z_syndrome
                 _, hard_x, conv_x = inter_dec_x.forward_stages(
                     z_syn_t, llr_x_t,
                     stage_iters=[stage1_iters, stage2_iters],
-                    correction_fn=_make_correction_fn(x_syn_t, z_syn_t, start),
+                    correction_fn=_make_correction_fn(start, inter_corr_llr_x),
                 )
 
             inter_hard_z_all.append(hard_z.cpu().numpy())
@@ -896,7 +970,8 @@ def evaluate_code_capacity(
         inter_logical = _check_logical_errors_batch(inter_z_errors, inter_x_errors, lx, lz, observables)
         interleaved_bp_errors = int(inter_logical.sum())
         interleaved_bp_converged = int(inter_conv.sum())
-        print(f"  Interleaved done: {shots / (time.time() - t_inter):.0f} shots/s")
+        inter_secs = round(time.time() - t_inter, 2)
+        print(f"  Interleaved done: {shots / inter_secs:.0f} shots/s")
 
     # ---------- BP-OSD (parallel with threads) ----------
     # Use ThreadPoolExecutor: BP-OSD and MWPM are C-extension-backed
@@ -931,7 +1006,8 @@ def evaluate_code_capacity(
             results_bposd = list(pool.map(_bposd_shot, range(shots)))
 
         bposd_errors = sum(results_bposd)
-        print(f"  BP-OSD done: {shots / (time.time() - t_bposd):.0f} shots/s ({n_workers} workers)")
+        bposd_secs = round(time.time() - t_bposd, 2)
+        print(f"  BP-OSD done: {shots / bposd_secs:.0f} shots/s ({n_workers} workers)")
 
     # ---------- MWPM (parallel with threads) ----------
     mwpm_errors = 0
@@ -963,7 +1039,8 @@ def evaluate_code_capacity(
             results_mwpm = list(pool.map(_mwpm_shot, range(shots)))
 
         mwpm_errors = sum(results_mwpm)
-        print(f"  MWPM done: {shots / (time.time() - t_mwpm):.0f} shots/s ({n_workers} workers)")
+        mwpm_secs = round(time.time() - t_mwpm, 2)
+        print(f"  MWPM done: {shots / mwpm_secs:.0f} shots/s ({n_workers} workers)")
 
     # ---------- BP-LSD (parallel with threads) ----------
     bplsd_errors = 0
@@ -995,7 +1072,8 @@ def evaluate_code_capacity(
             results_bplsd = list(pool.map(_bplsd_shot, range(shots)))
 
         bplsd_errors = sum(results_bplsd)
-        print(f"  BP-LSD done: {shots / (time.time() - t_bplsd):.0f} shots/s ({n_workers} workers)")
+        bplsd_secs = round(time.time() - t_bplsd, 2)
+        print(f"  BP-LSD done: {shots / bplsd_secs:.0f} shots/s ({n_workers} workers)")
 
     # ---------- BeliefFind (parallel with threads) ----------
     bf_errors = 0
@@ -1026,7 +1104,8 @@ def evaluate_code_capacity(
             results_bf = list(pool.map(_bf_shot, range(shots)))
 
         bf_errors = sum(results_bf)
-        print(f"  BeliefFind done: {shots / (time.time() - t_bf):.0f} shots/s ({n_workers} workers)")
+        bf_secs = round(time.time() - t_bf, 2)
+        print(f"  BeliefFind done: {shots / bf_secs:.0f} shots/s ({n_workers} workers)")
 
     # ---------- GNN + BP-LSD (the novel combination) ----------
     gnn_bplsd_errors = 0
@@ -1101,7 +1180,8 @@ def evaluate_code_capacity(
             results_gnn_bplsd = list(pool.map(_gnn_bplsd_shot, range(shots)))
 
         gnn_bplsd_errors = sum(results_gnn_bplsd)
-        print(f"  GNN+BP-LSD done: {shots / (time.time() - t_gnn_lsd):.0f} shots/s total")
+        gnn_lsd_secs = round(time.time() - t_gnn_lsd, 2)
+        print(f"  GNN+BP-LSD done: {shots / gnn_lsd_secs:.0f} shots/s total")
 
     # ---------- GNN + BP-OSD (novel combination) ----------
     gnn_bposd_errors = 0
@@ -1171,7 +1251,76 @@ def evaluate_code_capacity(
             results_gnn_bposd = list(pool.map(_gnn_bposd_shot, range(shots)))
 
         gnn_bposd_errors = sum(results_gnn_bposd)
-        print(f"  GNN+BP-OSD done: {shots / (time.time() - t_gnn_osd):.0f} shots/s total")
+        gnn_osd_secs = round(time.time() - t_gnn_osd, 2)
+        print(f"  GNN+BP-OSD done: {shots / gnn_osd_secs:.0f} shots/s total")
+
+    # ---------- Interleaved GNN + BP-OSD (best interleaved LLRs -> OSD) ----------
+    inter_bposd_errors = 0
+    inter_bposd_available = False
+    if gnn_model is not None and has_interleaved and use_bposd:
+        try:
+            from gnn_pipeline.bposd_decoder import run_css_bposd_with_llr
+            inter_bposd_available = True
+        except ImportError:
+            pass
+
+    if inter_bposd_available:
+        import concurrent.futures
+        import os
+
+        print("\nInterleaved GNN + BP-OSD (interleaved-corrected LLRs -> BP-OSD)...")
+        t_inter_osd = time.time()
+        n_workers = max(1, os.cpu_count() - 1)
+
+        def _inter_bposd_shot(idx):
+            z_e, x_e = run_css_bposd_with_llr(
+                all_x_syn[idx], all_z_syn[idx], hx, hz,
+                per_qubit_llr_z=inter_corr_llr_z[idx],
+                per_qubit_llr_x=inter_corr_llr_x[idx],
+                osd_order=osd_order,
+            )
+            return _check_logical_error(z_e, x_e, lx, lz, observables[idx])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results_inter_bposd = list(pool.map(_inter_bposd_shot, range(shots)))
+
+        inter_bposd_errors = sum(results_inter_bposd)
+        inter_osd_secs = round(time.time() - t_inter_osd, 2)
+        print(f"  Interleaved GNN+BP-OSD done: {shots / inter_osd_secs:.0f} shots/s ({n_workers} workers)")
+
+    # ---------- Interleaved GNN + BP-LSD (best interleaved LLRs -> LSD) ----------
+    inter_bplsd_errors = 0
+    inter_bplsd_available = False
+    if gnn_model is not None and has_interleaved and use_bplsd:
+        try:
+            from gnn_pipeline.bplsd_decoder import run_css_bplsd_with_llr
+            inter_bplsd_available = True
+        except ImportError:
+            pass
+
+    if inter_bplsd_available:
+        import concurrent.futures
+        import os
+
+        print("\nInterleaved GNN + BP-LSD (interleaved-corrected LLRs -> BP-LSD)...")
+        t_inter_lsd = time.time()
+        n_workers = max(1, os.cpu_count() - 1)
+
+        def _inter_bplsd_shot(idx):
+            z_e, x_e = run_css_bplsd_with_llr(
+                all_x_syn[idx], all_z_syn[idx], hx, hz,
+                per_qubit_llr_z=inter_corr_llr_z[idx],
+                per_qubit_llr_x=inter_corr_llr_x[idx],
+                lsd_order=lsd_order, lsd_method=lsd_method,
+            )
+            return _check_logical_error(z_e, x_e, lx, lz, observables[idx])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results_inter_bplsd = list(pool.map(_inter_bplsd_shot, range(shots)))
+
+        inter_bplsd_errors = sum(results_inter_bplsd)
+        inter_lsd_secs = round(time.time() - t_inter_lsd, 2)
+        print(f"  Interleaved GNN+BP-LSD done: {shots / inter_lsd_secs:.0f} shots/s ({n_workers} workers)")
 
     elapsed = time.time() - t_start
 
@@ -1191,6 +1340,13 @@ def evaluate_code_capacity(
         "code": {"n": int(n), "mx": int(mx), "mz": int(mz)},
         "noise": {"p": p, "eta": eta, "pz": pz, "px": px},
         "has_per_shot_p": has_per_shot_p,
+        "use_syndrome_p": use_syndrome_p,
+        "syndrome_p_estimate": {
+            "mean": float(syn_p_hat.mean()),
+            "std": float(syn_p_hat.std()),
+            "min": float(syn_p_hat.min()),
+            "max": float(syn_p_hat.max()),
+        },
         "test_shots": shots,
         "elapsed_seconds": round(elapsed, 1),
         "bp": {
@@ -1199,6 +1355,7 @@ def evaluate_code_capacity(
             "ler_ci_low": float(bp_ler_low),
             "ler_ci_high": float(bp_ler_high),
             "convergence_rate": float(bp_converged / shots),
+            "seconds": bp_secs,
         },
     }
 
@@ -1221,6 +1378,7 @@ def evaluate_code_capacity(
             "ler_ci_low": float(oracle_ler_low),
             "ler_ci_high": float(oracle_ler_high),
             "convergence_rate": float(oracle_bp_converged / shots),
+            "seconds": oracle_secs,
         }
 
     if gnn_model is not None:
@@ -1242,6 +1400,7 @@ def evaluate_code_capacity(
             "ler_ci_low": float(gnn_bp_ler_low),
             "ler_ci_high": float(gnn_bp_ler_high),
             "convergence_rate": float(gnn_bp_converged / shots),
+            "seconds": gnn_secs,
         }
         results["improvement_pct"] = float(100 * improvement)
 
@@ -1264,6 +1423,7 @@ def evaluate_code_capacity(
             "ler_ci_low": float(inter_ler_low),
             "ler_ci_high": float(inter_ler_high),
             "convergence_rate": float(interleaved_bp_converged / shots),
+            "seconds": inter_secs,
         }
 
     if bposd_available:
@@ -1283,6 +1443,7 @@ def evaluate_code_capacity(
             "ler": float(bposd_ler),
             "ler_ci_low": float(bposd_ler_low),
             "ler_ci_high": float(bposd_ler_high),
+            "seconds": bposd_secs,
         }
 
     if mwpm_available:
@@ -1302,6 +1463,7 @@ def evaluate_code_capacity(
             "ler": float(mwpm_ler),
             "ler_ci_low": float(mwpm_ler_low),
             "ler_ci_high": float(mwpm_ler_high),
+            "seconds": mwpm_secs,
         }
 
     if bplsd_available:
@@ -1321,6 +1483,7 @@ def evaluate_code_capacity(
             "ler": float(bplsd_ler),
             "ler_ci_low": float(bplsd_ler_low),
             "ler_ci_high": float(bplsd_ler_high),
+            "seconds": bplsd_secs,
         }
 
     if bf_available:
@@ -1340,6 +1503,7 @@ def evaluate_code_capacity(
             "ler": float(bf_ler),
             "ler_ci_low": float(bf_ler_low),
             "ler_ci_high": float(bf_ler_high),
+            "seconds": bf_secs,
         }
 
     if gnn_bplsd_available:
@@ -1363,6 +1527,7 @@ def evaluate_code_capacity(
             "ler": float(gnn_bplsd_ler),
             "ler_ci_low": float(gnn_bplsd_ler_low),
             "ler_ci_high": float(gnn_bplsd_ler_high),
+            "seconds": gnn_lsd_secs,
         }
 
     if gnn_bposd_available:
@@ -1386,6 +1551,55 @@ def evaluate_code_capacity(
             "ler": float(gnn_bposd_ler),
             "ler_ci_low": float(gnn_bposd_ler_low),
             "ler_ci_high": float(gnn_bposd_ler_high),
+            "seconds": gnn_osd_secs,
+        }
+
+    if inter_bposd_available:
+        inter_bposd_ler = inter_bposd_errors / shots if shots > 0 else 0.0
+        inter_bposd_ler_low, inter_bposd_ler_high = wilson_score_interval_binom(inter_bposd_errors, shots)
+
+        print(f"\nInterleaved GNN + BP-OSD (interleaved LLRs -> BP-OSD):")
+        print(f"  Logical Error Rate: {inter_bposd_ler:.6f}")
+        print(f"  95% CI: [{inter_bposd_ler_low:.6f}, {inter_bposd_ler_high:.6f}]")
+        print(f"  Errors: {inter_bposd_errors}/{shots}")
+
+        bp_vs_inter_bposd = (bp_ler - inter_bposd_ler) / bp_ler if bp_ler > 0 else 0.0
+        print(f"  Improvement over BP: {100*bp_vs_inter_bposd:.1f}%")
+
+        if bposd_available:
+            osd_vs_inter = (bposd_ler - inter_bposd_ler) / bposd_ler if bposd_ler > 0 else 0.0
+            print(f"  Improvement over plain BP-OSD: {100*osd_vs_inter:.1f}%")
+
+        results["interleaved_gnn_bposd"] = {
+            "errors": int(inter_bposd_errors),
+            "ler": float(inter_bposd_ler),
+            "ler_ci_low": float(inter_bposd_ler_low),
+            "ler_ci_high": float(inter_bposd_ler_high),
+            "seconds": inter_osd_secs,
+        }
+
+    if inter_bplsd_available:
+        inter_bplsd_ler = inter_bplsd_errors / shots if shots > 0 else 0.0
+        inter_bplsd_ler_low, inter_bplsd_ler_high = wilson_score_interval_binom(inter_bplsd_errors, shots)
+
+        print(f"\nInterleaved GNN + BP-LSD (interleaved LLRs -> BP-LSD):")
+        print(f"  Logical Error Rate: {inter_bplsd_ler:.6f}")
+        print(f"  95% CI: [{inter_bplsd_ler_low:.6f}, {inter_bplsd_ler_high:.6f}]")
+        print(f"  Errors: {inter_bplsd_errors}/{shots}")
+
+        bp_vs_inter_bplsd = (bp_ler - inter_bplsd_ler) / bp_ler if bp_ler > 0 else 0.0
+        print(f"  Improvement over BP: {100*bp_vs_inter_bplsd:.1f}%")
+
+        if bplsd_available:
+            lsd_vs_inter = (bplsd_ler - inter_bplsd_ler) / bplsd_ler if bplsd_ler > 0 else 0.0
+            print(f"  Improvement over plain BP-LSD: {100*lsd_vs_inter:.1f}%")
+
+        results["interleaved_gnn_bplsd"] = {
+            "errors": int(inter_bplsd_errors),
+            "ler": float(inter_bplsd_ler),
+            "ler_ci_low": float(inter_bplsd_ler_low),
+            "ler_ci_high": float(inter_bplsd_ler_high),
+            "seconds": inter_lsd_secs,
         }
 
     # ---------- Collect per-shot outcomes for statistical testing ----------
@@ -1406,6 +1620,10 @@ def evaluate_code_capacity(
         decoder_outcomes["GNN + BP-LSD"] = np.array(results_gnn_bplsd, dtype=bool)
     if gnn_bposd_available:
         decoder_outcomes["GNN + BP-OSD"] = np.array(results_gnn_bposd, dtype=bool)
+    if inter_bposd_available:
+        decoder_outcomes["Interleaved GNN + BP-OSD"] = np.array(results_inter_bposd, dtype=bool)
+    if inter_bplsd_available:
+        decoder_outcomes["Interleaved GNN + BP-LSD"] = np.array(results_inter_bplsd, dtype=bool)
     if mwpm_available:
         decoder_outcomes["MWPM"] = np.array(results_mwpm, dtype=bool)
 
@@ -1435,6 +1653,10 @@ def evaluate_code_capacity(
     if gnn_model is not None and has_interleaved:
         inter_ler_val = interleaved_bp_errors / shots if shots > 0 else 0.0
         decoder_table.append(("Interleaved GNN-BP", inter_ler_val))
+    if inter_bposd_available:
+        decoder_table.append(("Interleaved GNN + BP-OSD", inter_bposd_ler))
+    if inter_bplsd_available:
+        decoder_table.append(("Interleaved GNN + BP-LSD", inter_bplsd_ler))
     if mwpm_available:
         decoder_table.append(("MWPM", mwpm_ler))
 
@@ -1685,7 +1907,8 @@ def evaluate_circuit_level(
                 elapsed = time.time() - t_gnn
                 print(f"  GNN-BP: {end}/{shots} shots ({end / elapsed:.0f} shots/s)")
 
-        print(f"  GNN-BP done: {shots / (time.time() - t_gnn):.0f} shots/s")
+        gnn_secs = round(time.time() - t_gnn, 2)
+        print(f"  GNN-BP done: {shots / gnn_secs:.0f} shots/s")
 
     # --- BP-OSD on DEM (per-shot, parallelized) ---
     if bposd_dem_available:
@@ -1711,7 +1934,8 @@ def evaluate_circuit_level(
 
         bposd_errors = sum(r[0] for r in results_bposd)
         bposd_converged = sum(r[1] for r in results_bposd)
-        print(f"  BP-OSD done: {shots / (time.time() - t_bposd):.0f} shots/s ({n_workers} workers)")
+        bposd_secs = round(time.time() - t_bposd, 2)
+        print(f"  BP-OSD done: {shots / bposd_secs:.0f} shots/s ({n_workers} workers)")
 
     elapsed = time.time() - t_start
 
@@ -1854,6 +2078,9 @@ def main(argv: List[str] | None = None) -> int:
                         help="LSD method for BP-LSD decoder")
     parser.add_argument("--osd_order", type=int, default=0,
                         help="OSD order for BP-OSD decoder (0=fastest, higher=stronger)")
+    parser.add_argument("--use_syndrome_p", action="store_true",
+                        help="Use syndrome-estimated p for FiLM instead of oracle p "
+                             "(tests practical noise-blind operation)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out_dir", type=str, required=True,
                         help="Output directory for results")
@@ -1886,7 +2113,9 @@ def main(argv: List[str] | None = None) -> int:
             gnn_noise_feat_dim = checkpoint.get("noise_feat_dim", 1)
             # DEM models use edge_types=1, code-capacity uses edge_types=2
             gnn_edge_types = checkpoint.get("edge_types", 2)
+            gnn_node_feat_dim = checkpoint.get("node_feat_dim", 4)
             gnn_model_inst = TannerGNN(
+                node_feat_dim=gnn_node_feat_dim,
                 hidden_dim=checkpoint.get("hidden_dim", 64),
                 num_mp_layers=checkpoint.get("num_mp_layers", 3),
                 edge_types=gnn_edge_types,
@@ -1900,6 +2129,8 @@ def main(argv: List[str] | None = None) -> int:
             )
             gnn_model_inst.load_state_dict(checkpoint["model_state_dict"])
             ckpt_mode = checkpoint.get("mode", "code_capacity")
+            if ckpt_mode != args.mode:
+                print(f"  WARNING: checkpoint trained in '{ckpt_mode}' mode but evaluating in '{args.mode}' mode")
             film_str = f", film={gnn_use_film}" if gnn_use_film else ""
             print(f"  Loaded checkpoint (mode={ckpt_mode}, hidden_dim={checkpoint.get('hidden_dim', 64)}, "
                   f"num_mp_layers={checkpoint.get('num_mp_layers', 3)}, "
@@ -1926,6 +2157,7 @@ def main(argv: List[str] | None = None) -> int:
             lsd_method=args.lsd_method,
             osd_order=args.osd_order,
             checkpoint=gnn_checkpoint,
+            use_syndrome_p=args.use_syndrome_p,
         )
     elif args.mode == "circuit_level":
         results = evaluate_circuit_level(

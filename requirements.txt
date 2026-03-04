@@ -1,0 +1,23 @@
+# QLDPC GNN-BP Pipeline — GPU Requirements
+#
+# For NVIDIA GPU (CUDA 12.1):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#   pip install torch-geometric torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.5.0+cu121.html
+#   pip install -r requirements.txt
+#
+# For CPU-only:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   pip install torch-geometric torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.5.0+cpu.html
+#   pip install -r requirements.txt
+
+numpy>=1.24,<3
+scipy>=1.10
+stim>=1.13
+matplotlib>=3.7
+pandas>=2.0
+ldpc>=2.2.8
+pymatching>=2.3.0
+
+# Optional: monitoring
+# tensorboard>=2.0
+# wandb>=0.13
