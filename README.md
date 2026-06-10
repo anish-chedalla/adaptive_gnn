@@ -8,9 +8,9 @@
 
 ## Authors
 
-**Jothiradithya (Sai) Konduru** · sai.konduru10@gmail.com  
-**Anish Chedalla** · anishchedalla@gmail.com  
-**Dr. Nithin Raveendran** · UArizona STAR Lab / QEC Labs
+**Jothiradithya (Sai) Konduru** · sai.konduru10@gmail.com · Paradise Valley High School
+**Anish Chedalla** · anishchedalla@gmail.com · Paradise Valley High School
+**Dr. Nithin Raveendran** · nithin@arizona.edu · UArizona STAR Lab / QEC Labs
 
 ---
 
