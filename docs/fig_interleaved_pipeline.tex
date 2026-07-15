@@ -1,9 +1,9 @@
-\documentclass[border=12pt]{standalone}
+\documentclass[border=16pt]{standalone}
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta, positioning, calc, fit, backgrounds}
+\usetikzlibrary{arrows.meta, calc}
 \usepackage{amsmath, amssymb}
 
-% ── Palette ────────────────────────────────────────────────────────────────
+% ── Palette ──────────────────────────────────────────────────────────────────
 \definecolor{gnnblue}{RGB}{70,130,190}
 \definecolor{gnnfill}{RGB}{210,228,248}
 \definecolor{bpgreen}{RGB}{60,155,90}
@@ -12,197 +12,218 @@
 \definecolor{fillfill}{RGB}{252,235,205}
 \definecolor{iogray}{RGB}{100,100,100}
 \definecolor{iofill}{RGB}{235,235,235}
-\definecolor{plusgray}{RGB}{80,80,80}
+
+%
+%  LAYER MAP  (all y values in TikZ units = cm)
+%  ───────────────────────────────────────────────────────────────────────────
+%  y = 6.0   FiLM Generator box
+%  y = 4.6   FiLM horizontal branch routing  ← γ,β labels go here
+%  y = 3.0   Main pipeline  (all blocks & arrows)
+%  y = 1.6   Formula annotation strip        ← Λ'=…  Λ''=… labels go here
+%  y = 0.4   Passthrough routing             ← Λ / Λmid bypass lines
+%  y = -0.9  Legend
+%
+%  x positions:
+%   syn/llr: -4.2   gnn1: 0.0   add1: 3.0
+%   bp1: 6.2        gnn2: 9.8   add2: 13.0
+%   bp2: 16.2       hard: 19.0  out: 20.7
+%   film: 4.9       pest: 0.5
+% ───────────────────────────────────────────────────────────────────────────
 
 \begin{document}
 \begin{tikzpicture}[
     >=Stealth,
     font=\sffamily\small,
-    % ── Node styles ──────────────────────────────────────────────────────
-    gnn/.style={
-        rectangle, draw=gnnblue, fill=gnnfill, line width=0.9pt,
-        rounded corners=4pt, minimum width=2.1cm, minimum height=1.15cm,
-        align=center, font=\sffamily\small
-    },
-    bp/.style={
-        rectangle, draw=bpgreen, fill=bpfill, line width=0.9pt,
-        rounded corners=4pt, minimum width=2.1cm, minimum height=1.15cm,
-        align=center, font=\sffamily\small
-    },
-    film/.style={
-        rectangle, draw=filmorange, fill=fillfill, line width=0.9pt,
-        rounded corners=4pt, minimum width=3.8cm, minimum height=1.0cm,
-        align=center, font=\sffamily\small
-    },
-    io/.style={
-        rectangle, draw=iogray!60, fill=iofill, line width=0.7pt,
-        rounded corners=3pt, minimum width=1.1cm, minimum height=0.75cm,
-        align=center, font=\sffamily\footnotesize
-    },
-    plus/.style={
-        circle, draw=plusgray, fill=white, line width=0.8pt,
-        minimum size=0.52cm, inner sep=0pt,
-        font=\sffamily\normalsize
-    },
-    hard/.style={
-        rectangle, draw=iogray!60, fill=iofill, line width=0.7pt,
-        rounded corners=3pt, minimum width=1.5cm, minimum height=0.75cm,
-        align=center, font=\sffamily\footnotesize
-    },
-    % ── Arrow styles ─────────────────────────────────────────────────────
-    mainarr/.style={->, thick, black!55},
-    filmarr/.style={->, semithick, filmorange!80, dashed},
-    labelnode/.style={font=\sffamily\scriptsize, inner sep=2pt}
+    gnn/.style  = {rectangle, draw=gnnblue, fill=gnnfill, line width=0.9pt,
+                   rounded corners=4pt,
+                   minimum width=2.6cm, minimum height=1.1cm, align=center},
+    bp/.style   = {rectangle, draw=bpgreen, fill=bpfill, line width=0.9pt,
+                   rounded corners=4pt,
+                   minimum width=2.5cm, minimum height=1.1cm, align=center},
+    film/.style = {rectangle, draw=filmorange, fill=fillfill, line width=0.9pt,
+                   rounded corners=4pt,
+                   minimum width=5.2cm, minimum height=1.1cm, align=center},
+    io/.style   = {rectangle, draw=iogray!60, fill=iofill, line width=0.7pt,
+                   rounded corners=3pt, minimum width=1.2cm, minimum height=0.7cm,
+                   align=center, font=\sffamily\footnotesize},
+    hd/.style   = {rectangle, draw=iogray!60, fill=iofill, line width=0.7pt,
+                   rounded corners=3pt, minimum width=1.6cm, minimum height=0.7cm,
+                   align=center, font=\sffamily\footnotesize},
+    plus/.style = {circle, draw=black!60, fill=white, line width=0.9pt,
+                   minimum size=0.6cm, inner sep=0pt},
+    arr/.style  = {->, thick, black!55},
+    farr/.style = {filmorange!80, dashed, semithick},
+    lbl/.style  = {font=\sffamily\scriptsize, inner sep=1.5pt}
 ]
 
 % ════════════════════════════════════════════════════════════════════════════
-%  ROW POSITIONS
-%    film_y  = 5.2   (FiLM generator row)
-%    pipe_y  = 2.0   (main pipeline row)
-%    gamma_y = 3.7   (γ,β label clearance row — between film and pipe)
+%  PIPELINE NODES  (y = 3.0)
 % ════════════════════════════════════════════════════════════════════════════
 
-% ── Input nodes ─────────────────────────────────────────────────────────────
-\node[io] (syn)  at (-3.5, 2.55) {Syndrome\\$\mathbf{s}$};
-\node[io] (llr)  at (-3.5, 1.45) {Channel $\boldsymbol{\Lambda}$};
+\node[io]   (syn)  at (-4.2, 3.55) {Syndrome\\\textbf{s}};
+\node[io]   (llr)  at (-4.2, 2.45) {Channel $\boldsymbol{\Lambda}$};
+\coordinate (join) at (-2.5, 3.00);   % merge point for syn+llr
 
-% ── Merge of syndrome + LLR into first GNN ──────────────────────────────────
-% (a small invisible join point)
-\coordinate (join) at (-2.0, 2.0);
+\node[gnn]  (gnn1) at ( 0.0, 3.0) {\textbf{TannerGNN}$_1$};
+\node[plus] (add1) at ( 3.0, 3.0) {$+$};
+\node[bp]   (bp1)  at ( 6.2, 3.0) {\textbf{Neural BP}\\Stage 1};
+\node[gnn]  (gnn2) at ( 9.8, 3.0) {\textbf{TannerGNN}$_2$};
+\node[plus] (add2) at (13.0, 3.0) {$+$};
+\node[bp]   (bp2)  at (16.2, 3.0) {\textbf{Neural BP}\\Stage 2};
+\node[hd]   (hard) at (19.0, 3.0) {Hard\\Decision};
+\node[io]   (out)  at (20.7, 3.0) {$\hat{\mathbf{e}}$};
 
-% ── TannerGNN₁ ──────────────────────────────────────────────────────────────
-\node[gnn] (gnn1) at (0.0, 2.0) {\textbf{TannerGNN}$_1$};
+% ════════════════════════════════════════════════════════════════════════════
+%  FiLM GENERATOR  (y = 6.0)
+% ════════════════════════════════════════════════════════════════════════════
 
-% ── Adder 1 ─────────────────────────────────────────────────────────────────
-\node[plus] (add1) at (2.25, 2.0) {$+$};
-
-% ── Neural BP Stage 1 ───────────────────────────────────────────────────────
-\node[bp]  (bp1)  at (4.55, 2.0) {\textbf{Neural BP}\\Stage 1};
-
-% ── p_i^{mid} label sits on the arrow between BP1 and GNN2
-%    (placed at mid arrow, above the line)
-
-% ── TannerGNN₂ ──────────────────────────────────────────────────────────────
-\node[gnn] (gnn2) at (7.3, 2.0) {\textbf{TannerGNN}$_2$};
-
-% ── Adder 2 ─────────────────────────────────────────────────────────────────
-\node[plus] (add2) at (9.55, 2.0) {$+$};
-
-% ── Neural BP Stage 2 ───────────────────────────────────────────────────────
-\node[bp]  (bp2)  at (11.85, 2.0) {\textbf{Neural BP}\\Stage 2};
-
-% ── Hard Decision ───────────────────────────────────────────────────────────
-\node[hard] (hd) at (14.1, 2.0) {Hard\\Decision};
-
-% ── Output ──────────────────────────────────────────────────────────────────
-\node[io]  (out) at (15.8, 2.0) {$\hat{\mathbf{e}}$};
-
-% ── FiLM Generator (top row, well above pipeline) ───────────────────────────
-\node[film] (film) at (3.65, 5.2)
+\node[io]   (pest) at (0.5, 6.0) {$\hat{p}$\\(noise est.)};
+\node[film] (film) at (4.9, 6.0)
     {\textbf{FiLM Generator}\\[2pt]
-     $\hat{\sigma}_s \;\longrightarrow\; \{\gamma_\ell,\beta_\ell\}_{\ell=1}^{L}$};
-
-% Noise estimator feeding FiLM
-\node[io] (noiseest) at (-0.5, 5.2) {$\hat{p}$\\(noise est.)};
-\draw[mainarr] (noiseest) -- (film.west);
+     $\hat{\sigma}_s \;\to\; \{\gamma_\ell,\,\beta_\ell\}_{\ell=1}^{L}$};
 
 % ════════════════════════════════════════════════════════════════════════════
-%  FiLM → GNN branches
-%  Route: film.south → down to γ,β label clearance height → then to GNN tops
-%  Labels placed at the bend point, well clear of both the film box and GNNs
+%  MAIN PIPELINE ARROWS
+%  – Δ labels: standalone nodes placed ABOVE arrows, yshift large enough to
+%    clear box edges; never on-arrow text that can brush a node corner
+%  – p_i^mid: standalone node floated high above the bp1→gnn2 gap
 % ════════════════════════════════════════════════════════════════════════════
 
-% Branch point on film bottom
-\coordinate (filmbottom) at (3.65, 4.7);
+\draw[arr] (syn.east) -| (join);
+\draw[arr] (llr.east) -| (join);
+\draw[arr] (join)     -- (gnn1.west);
+\draw[arr] (gnn1.east)-- (add1.west);   % Δ(1) label below ↓
+\draw[arr] (add1.east)-- (bp1.west);
+\draw[arr] (bp1.east) -- (gnn2.west);   % p_i^mid label below ↓
+\draw[arr] (gnn2.east)-- (add2.west);   % Δ(2) label below ↓
+\draw[arr] (add2.east)-- (bp2.west);
+\draw[arr] (bp2.east) -- (hard.west);
+\draw[arr] (hard.east)-- (out.west);
 
-% Left FiLM branch: goes to gnn1 top
-\coordinate (filmL_bend) at (0.0, 3.85);
-\draw[filmarr]
-    (film.south) -- (filmbottom)
-    -- (filmL_bend) -- (gnn1.north);
-\node[labelnode, filmorange!90, above right] at ($(filmL_bend)+(0.05,0)$)
-    {$\gamma^{(1)}\!,\beta^{(1)}$};
+% Δ(1): above the gnn1→add1 gap, offset high enough to miss both box corners
+% gnn1.east=(1.3,3), add1.west=(2.725,3)  → midpoint x=2.0125
+\node[lbl, above] at (2.0, 3.55) {$\Delta^{(1)}$};
 
-% Right FiLM branch: goes to gnn2 top
-\coordinate (filmR_bend) at (7.3, 3.85);
-\draw[filmarr]
-    (film.south) -- (filmbottom)
-    -- (filmR_bend) -- (gnn2.north);
-\node[labelnode, filmorange!90, above right] at ($(filmR_bend)+(0.05,0)$)
-    {$\gamma^{(2)}\!,\beta^{(2)}$};
+% Δ(2): above the gnn2→add2 gap
+% gnn2.east=(11.1,3), add2.west=(12.725,3) → midpoint x=11.9
+\node[lbl, above] at (11.9, 3.55) {$\Delta^{(2)}$};
+
+% p_i^mid: floated clearly above the bp1→gnn2 gap, below FiLM branch level
+% bp1.east=(7.45,3), gnn2.west=(8.5,3)  → midpoint x=7.975
+% y=3.9 clears all node tops (y=3.55) and stays below FiLM branch (y=4.6)
+\node[lbl, above] at (7.975, 3.9) {$p_i^{\mathrm{mid}}$};
 
 % ════════════════════════════════════════════════════════════════════════════
-%  Main pipeline arrows
+%  FiLM BRANCHES  (y = 4.6 horizontal routing layer)
+%
+%  Routing: film.south → stem → junction → LEFT horizontal → gnn1.north
+%                                        → RIGHT horizontal → gnn2.north
+%  No diagonals.  γ,β labels sit ABOVE their horizontal segments, with
+%  >1 unit clearance from the vertical descent into each GNN.
 % ════════════════════════════════════════════════════════════════════════════
 
-% Syndrome + channel → join → gnn1
-\draw[mainarr] (syn.east)  -| (join);
-\draw[mainarr] (llr.east)  -| (join);
-\draw[mainarr] (join) -- (gnn1.west);
+% film.south ≈ (4.9, 5.45).   Branch horizontal y = 4.6.
+\coordinate (fjunc) at (4.9, 4.6);
 
-% GNN1 → adder1: label Δ^(1) above arrow, away from node edges
-\draw[mainarr] (gnn1.east) -- (add1.west)
-    node[labelnode, above, midway] {$\Delta^{(1)}$};
+% Stem – no arrowhead
+\draw[farr] (film.south) -- (fjunc);
+\fill[filmorange!70] (fjunc) circle (2.5pt);   % branch-point dot
 
-% Channel passthrough to adder1 (Λ enters from below)
-\coordinate (llr_to_add1) at (2.25, 0.85);
-\draw[mainarr] (llr.south) |- (llr_to_add1) -- (add1.south)
-    node[labelnode, right, pos=0.92] {$\Lambda$};
+% Left branch: horizontal to x=0 then straight down to gnn1.north (0, 3.55)
+\draw[->, farr] (fjunc) -- (0.0, 4.6) -- (gnn1.north);
 
-% adder1 → bp1
-\draw[mainarr] (add1.east) -- (bp1.west)
-    node[labelnode, above, midway, yshift=1pt]
+% γ(1),β(1): above the horizontal segment, near its midpoint
+% segment runs x=0 → x=4.9; midpoint ≈ x=2.3
+% anchor is south so the text sits clearly above the wire
+\node[lbl, filmorange!90, above] at (2.3, 4.6)
+    {$\gamma^{(1)}\!,\;\beta^{(1)}$};
+
+% Right branch: horizontal to x=9.8 then straight down to gnn2.north (9.8, 3.55)
+\draw[->, farr] (fjunc) -- (9.8, 4.6) -- (gnn2.north);
+
+% γ(2),β(2): above its horizontal segment midpoint ≈ x=7.35
+\node[lbl, filmorange!90, above] at (7.35, 4.6)
+    {$\gamma^{(2)}\!,\;\beta^{(2)}$};
+
+% ════════════════════════════════════════════════════════════════════════════
+%  PASSTHROUGH LINES  (y = 0.4 routing layer)
+%
+%  All routing runs BELOW the main pipeline.  Each line:
+%    junction on pipeline → vertical drop to y=0.4
+%    → horizontal run → vertical rise into (+).south
+%
+%  No label is placed on any vertical segment, only on horizontal segments,
+%  and only where there is no other horizontal line (different x ranges).
+%
+%  Λ   bypass: x range [−1.8, 3.0]  at y=0.4
+%  Λmid bypass: x range [7.6, 13.0] at y=0.4   (no overlap)
+% ════════════════════════════════════════════════════════════════════════════
+
+% ── Λ passthrough ───────────────────────────────────────────────────────────
+% Junction on join→gnn1 arrow.
+%   join=(-2.5,3), gnn1.west=(-1.3,3)  → pick x=−1.8 (between them)
+\coordinate (ljunc) at (-1.8, 3.0);
+\fill[black!50] (ljunc) circle (2pt);
+% Route: drop → horizontal (x: −1.8→3.0) → rise into add1.south
+\draw[arr]
+    (ljunc) -- (-1.8, 0.4)            % vertical drop
+             -- ( 3.0, 0.4)            % horizontal
+             -- (add1.south);          % vertical rise
+% "Λ" label above the horizontal segment, away from vertical ends
+% midpoint of [−1.8, 3.0] = 0.6
+\node[lbl, above] at (0.6, 0.4) {$\Lambda$};
+
+% ── Λmid passthrough ─────────────────────────────────────────────────────────
+% Junction just right of bp1.east (7.45,3); pick x=7.6
+\coordinate (mjunc) at (7.6, 3.0);
+\fill[black!50] (mjunc) circle (2pt);
+% Route: drop → horizontal (x: 7.6→13.0) → rise into add2.south
+\draw[arr]
+    (mjunc) -- ( 7.6, 0.4)             % vertical drop
+             -- (13.0, 0.4)             % horizontal
+             -- (add2.south);           % vertical rise
+% "Λmid" label above the horizontal segment
+% midpoint of [7.6, 13.0] = 10.3
+\node[lbl, above] at (10.3, 0.4) {$\Lambda_{\mathrm{mid}}$};
+
+% ════════════════════════════════════════════════════════════════════════════
+%  FORMULA ANNOTATIONS  (y = 1.6 strip)
+%
+%  Strictly between the passthrough layer (y=0.4) and the pipeline (y=3.0).
+%  Horizontally placed in the GAPS between nodes, offset from ALL vertical
+%  lines (passthrough drops/rises and node sides).
+%
+%  Vertical lines at x = −1.8 (Λ drop), 3.0 (Λ rise), 7.6 (Λmid drop), 13.0 (Λmid rise)
+%
+%  Formula Λ':  centred at x=5.1  (between Λ-rise at 3.0 and Λmid-drop at 7.6)
+%  Formula Λ'': centred at x=15.3 (right of Λmid-rise at 13.0, clear of bp2)
+% ════════════════════════════════════════════════════════════════════════════
+
+\node[lbl, align=center] at (5.1, 1.6)
     {$\Lambda' = \Lambda + \Delta^{(1)}$};
 
-% bp1 → gnn2: label p_i^{mid} above arrow
-\draw[mainarr] (bp1.east) -- (gnn2.west)
-    node[labelnode, above, midway] {$p_i^{\mathrm{mid}}$};
-
-% GNN2 → adder2: label Δ^(2) above arrow
-\draw[mainarr] (gnn2.east) -- (add2.west)
-    node[labelnode, above, midway] {$\Delta^{(2)}$};
-
-% Mid-LLR passthrough to adder2 (from bp1 output, routed below)
-\coordinate (midllr_src) at (5.8, 2.0);
-\coordinate (midllr_low) at (5.8, 0.85);
-\coordinate (add2_below) at (9.55, 0.85);
-\draw[mainarr] (midllr_src) |- (midllr_low) -- (add2_below) -- (add2.south)
-    node[labelnode, right, pos=0.92] {$\Lambda_{\mathrm{mid}}$};
-
-% adder2 → bp2
-\draw[mainarr] (add2.east) -- (bp2.west)
-    node[labelnode, above, midway, yshift=1pt]
+\node[lbl, align=center] at (15.3, 1.6)
     {$\Lambda'' = \Lambda_{\mathrm{mid}} + \Delta^{(2)}$};
 
-% bp2 → hard decision → output
-\draw[mainarr] (bp2.east) -- (hd.west);
-\draw[mainarr] (hd.east)  -- (out.west);
+% ════════════════════════════════════════════════════════════════════════════
+%  NOISE ESTIMATOR → FiLM
+% ════════════════════════════════════════════════════════════════════════════
+
+\draw[arr] (pest.east) -- (film.west);
 
 % ════════════════════════════════════════════════════════════════════════════
-%  Legend  (bottom strip, well below pipeline)
+%  LEGEND  (y ≈ −0.9)
 % ════════════════════════════════════════════════════════════════════════════
-\begin{scope}[shift={(0.0, -0.85)}]
 
-\fill[gnnfill]   (0.0, 0) rectangle (0.38, 0.28);
-\draw[gnnblue]   (0.0, 0) rectangle (0.38, 0.28);
-\node[anchor=west, font=\sffamily\scriptsize, iogray]
-    at (0.45, 0.14) {GNN (TannerGNN)};
-
-\fill[bpfill]    (3.5, 0) rectangle (3.88, 0.28);
-\draw[bpgreen]   (3.5, 0) rectangle (3.88, 0.28);
-\node[anchor=west, font=\sffamily\scriptsize, iogray]
-    at (3.95, 0.14) {Neural BP (learnable)};
-
-\fill[fillfill]  (7.5, 0) rectangle (7.88, 0.28);
-\draw[filmorange](7.5, 0) rectangle (7.88, 0.28);
-\node[anchor=west, font=\sffamily\scriptsize, iogray]
-    at (7.95, 0.14) {FiLM conditioning};
-
-\fill[iofill]    (11.4, 0) rectangle (11.78, 0.28);
-\draw[iogray!60] (11.4, 0) rectangle (11.78, 0.28);
-\node[anchor=west, font=\sffamily\scriptsize, iogray]
-    at (11.85, 0.14) {Input / Output};
-
+\begin{scope}[shift={(0.0, -0.9)}]
+  \fill[gnnfill]   (0.0,0) rectangle (0.38,0.28); \draw[gnnblue]   (0.0,0) rectangle (0.38,0.28);
+  \node[lbl, iogray, anchor=west] at (0.45, 0.14) {GNN (TannerGNN)};
+  \fill[bpfill]    (4.6,0) rectangle (4.98,0.28); \draw[bpgreen]   (4.6,0) rectangle (4.98,0.28);
+  \node[lbl, iogray, anchor=west] at (5.05, 0.14) {Neural BP (learnable)};
+  \fill[fillfill]  (9.8,0) rectangle (10.18,0.28);\draw[filmorange](9.8,0) rectangle (10.18,0.28);
+  \node[lbl, iogray, anchor=west] at (10.25,0.14) {FiLM conditioning};
+  \fill[iofill]   (14.8,0) rectangle (15.18,0.28);\draw[iogray!60](14.8,0) rectangle (15.18,0.28);
+  \node[lbl, iogray, anchor=west] at (15.25,0.14) {Input / Output};
 \end{scope}
 
 \end{tikzpicture}
