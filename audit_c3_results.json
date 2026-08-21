@@ -1,0 +1,29 @@
+{
+  "confound": 3,
+  "epoch0": {
+    "desc": "Epoch 0 (untrained)",
+    "mi": 0.000390442437492311,
+    "mm": 0.0001231168261299553,
+    "mo": 0.003344401717185974,
+    "ratio": 0.11674507741375327,
+    "mean_delta": 0.407166063785553,
+    "loss": 0.031481970101594925,
+    "vanishing": false,
+    "exploding": false,
+    "flag": "HEALTHY"
+  },
+  "trained": {
+    "desc": "Trained (/tmp/audit_c1_best.pt)",
+    "mi": 0.0003463179018581286,
+    "mm": 7.417461477286582e-05,
+    "mo": 0.0015877129153523128,
+    "ratio": 0.2181237541694728,
+    "mean_delta": 0.8535853028297424,
+    "loss": 0.0065919565968215466,
+    "vanishing": false,
+    "exploding": false,
+    "flag": "HEALTHY"
+  },
+  "checkpoint": "/tmp/audit_c1_best.pt",
+  "verdict": "HEALTHY"
+}
