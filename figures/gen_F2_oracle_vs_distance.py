@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Generate fig_F2_oracle_vs_distance — full text width (6.5 in).
+"""Generate fig_F2_oracle_vs_distance — column width (3.3 in).
 
-Professional PRL/Nature style:
-  - Endpoint labels offset to the right of the last data point
-  - No overlap: labels staggered vertically if needed
-  - Legend top-left in the empty corner (low-sigma values)
-  - Clean tick-in style axes
+Endpoint labels for sigma=1.0 only, placed to the right of the last
+data point with enough vertical offset to avoid the line.
 """
 import matplotlib
 matplotlib.use("Agg")
@@ -28,21 +25,21 @@ sigma_labels = {0.25: r"$\sigma=0.25$", 0.5: r"$\sigma=0.5$", 1.0: r"$\sigma=1.0
 plt.rcParams.update({
     "font.family":       "sans-serif",
     "font.sans-serif":   ["Arial", "Helvetica", "DejaVu Sans"],
-    "font.size":         9,
-    "axes.labelsize":    10,
-    "axes.titlesize":    9.5,
+    "font.size":         8,
+    "axes.labelsize":    9,
+    "axes.titlesize":    8.5,
     "axes.linewidth":    0.7,
-    "xtick.labelsize":   9,
-    "ytick.labelsize":   9,
+    "xtick.labelsize":   8,
+    "ytick.labelsize":   8,
     "xtick.direction":   "in",
     "ytick.direction":   "in",
     "xtick.top":         True,
     "ytick.right":       True,
-    "xtick.major.size":  3.5,
-    "ytick.major.size":  3.5,
-    "lines.linewidth":   1.6,
-    "lines.markersize":  7,
-    "legend.fontsize":   8.5,
+    "xtick.major.size":  3,
+    "ytick.major.size":  3,
+    "lines.linewidth":   1.5,
+    "lines.markersize":  6,
+    "legend.fontsize":   7.5,
     "legend.frameon":    True,
     "legend.framealpha": 0.92,
     "legend.edgecolor":  "#cccccc",
@@ -53,47 +50,44 @@ plt.rcParams.update({
     "pdf.fonttype":      42,
 })
 
-fig, ax = plt.subplots(figsize=(6.5, 3.2))
+# Extra right margin for endpoint labels
+fig, ax = plt.subplots(figsize=(3.3, 3.0))
+fig.subplots_adjust(right=0.82)
 
-# --- Plot lines ---
 for sigma in [0.25, 0.5, 1.0]:
     gaps = gap_data[sigma]
     ax.plot(distances, gaps,
             marker=markers[sigma], color=colors[sigma],
             label=sigma_labels[sigma],
-            linewidth=1.6, markersize=7,
-            markeredgewidth=0.7, markeredgecolor="white",
+            linewidth=1.5, markersize=6,
+            markeredgewidth=0.6, markeredgecolor="white",
             zorder=5)
 
-# --- Endpoint labels: staggered offsets to avoid overlap ---
-# At d=18: sigma=0.25→18%, 0.5→48%, 1.0→87%
-# Vertical gaps: 18 vs 48 = 30pp apart, 48 vs 87 = 39pp apart — no collision
-endpoint_offsets = {0.25: (+0.35, -1.5), 0.5: (+0.35, +1.5), 1.0: (+0.35, +1.5)}
+# Endpoint labels placed OUTSIDE the axes on the right
+# Values at d=18: sigma=0.25→18%, 0.5→48%, 1.0→87% — well separated
+label_y = {0.25: 18, 0.5: 48, 1.0: 87}
 for sigma in [0.25, 0.5, 1.0]:
-    x_end = distances[-1]
-    y_end = gap_data[sigma][-1]
-    dx, dy = endpoint_offsets[sigma]
-    ax.text(x_end + dx, y_end + dy, f"{y_end}%",
-            fontsize=8, color=colors[sigma],
-            ha="left", va="center", fontweight="bold")
+    ax.annotate(f"{label_y[sigma]}%",
+                xy=(18, label_y[sigma]),
+                xytext=(18.6, label_y[sigma]),
+                fontsize=7.5, color=colors[sigma],
+                fontweight="bold",
+                ha="left", va="center",
+                annotation_clip=False)
 
-# --- Axes ---
-ax.set_xlim(4.5, 20.5)
+ax.set_xlim(4.5, 18.5)
 ax.set_ylim(-2, 100)
 ax.set_xticks(distances)
-ax.set_xticklabels(code_labels, fontsize=9)
+ax.set_xticklabels(code_labels, fontsize=7.5)
 ax.set_xlabel("Code")
-ax.set_ylabel("LER reduction over mean-prior decoder (%)")
+ax.set_ylabel("LER reduction over mean-prior (%)")
 ax.yaxis.set_major_locator(plt.MultipleLocator(20))
 ax.yaxis.set_minor_locator(plt.MultipleLocator(10))
-ax.set_title(r"Oracle calibration gap (per-qubit prior $\to$ mean prior)", pad=5)
+ax.set_title(r"Oracle calibration gap", pad=4)
+ax.axhline(0, color="#cccccc", linewidth=0.5, zorder=0)
 
-# Legend in upper-left where data is sparse (low σ values start ~11%)
-ax.legend(loc="upper left", handlelength=1.8, handletextpad=0.5,
-          borderpad=0.6, labelspacing=0.4)
-
-# Horizontal reference line at 0
-ax.axhline(0, color="#aaaaaa", linewidth=0.5, zorder=0)
+ax.legend(loc="upper left", handlelength=1.6, handletextpad=0.4,
+          borderpad=0.5, labelspacing=0.35)
 
 out = Path(__file__).parent / "fig_F2_oracle_vs_distance.pdf"
 fig.savefig(out)

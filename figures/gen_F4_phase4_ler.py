@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """Generate fig_F4_phase4_ler — column width (3.3 in).
 
-Fixes vs previous version:
-  - All 4 p-values fully visible on log scale
-  - Annotation uses mathtext italic (not LaTeX \emph)
-  - Annotation placed in the UPPER area (not bottom, no clipping)
-  - Proper padding so nothing is cut off
+Annotation placed in the RIGHT side of the plot (away from the upper-left
+legend) pointing to the statistically-worse operating points.
 """
 import matplotlib
 matplotlib.use("Agg")
@@ -13,7 +10,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 
-# --- Data from Table 5 ---
 ps          = np.array([0.020, 0.030, 0.040, 0.050])
 bp_osd_ler  = np.array([0.0046, 0.0377, 0.0831, 0.1515])
 gnn_osd_ler = np.array([0.0050, 0.0399, 0.0876, 0.1555])
@@ -25,8 +21,8 @@ def wilson_ci(p_hat):
 bp_ci  = wilson_ci(bp_osd_ler)
 gnn_ci = wilson_ci(gnn_osd_ler)
 
-mcn_p     = np.array([0.68, 0.63, 0.033, 3.6e-5])
-worse_mask = mcn_p < 0.05   # p=0.040 and p=0.050
+mcn_p      = np.array([0.68, 0.63, 0.033, 3.6e-5])
+worse_mask = mcn_p < 0.05
 
 plt.rcParams.update({
     "font.family":       "sans-serif",
@@ -69,7 +65,7 @@ ax.errorbar(ps, gnn_osd_ler, yerr=gnn_ci,
             markeredgewidth=0.6, markeredgecolor="white",
             label="GNN + OSD", zorder=5)
 
-# Red × at points where GNN is significantly worse
+# Red × at statistically-worse points
 ax.scatter(ps[worse_mask], gnn_osd_ler[worse_mask],
            marker="x", color="#B03030", s=80, linewidths=2.2, zorder=8)
 
@@ -80,23 +76,25 @@ ax.set_xlabel(r"Physical error rate $p$")
 ax.set_ylabel("Logical Error Rate")
 ax.set_title(r"$[\![72,12,6]\!]$, $\eta=20$, serial BP-OSD, 8k shots", pad=4)
 
-# Legend in upper left
+# Legend upper LEFT
 ax.legend(loc="upper left", handlelength=1.5, handletextpad=0.4)
 
-# Annotation: upper-right area is empty (lines are at 0.004-0.05 for low p,
-# upper right of the log plot has space above p=0.04–0.05 range).
-# Place text in the middle-right where there's clear space.
+# Annotation: placed in the LOWER-RIGHT quadrant of the log plot
+# (below the two × marks, to the right) — far from the upper-left legend.
+# The × marks are at (0.040, 0.0876) and (0.050, 0.1555).
+# Lower-right has p~0.048, log-y ~0.009 (well below both × marks).
 ax.annotate(
-    r"$\times$ = GNN $\mathit{worse}$ (McNemar $p\!<\!0.05$)",
-    xy=(0.042, 0.088),
-    xytext=(0.027, 0.22),
+    r"$\times$ = GNN $\mathit{worse}$" "\n" r"(McNemar $p<0.05$)",
+    xy=(0.040, 0.0876),
+    xytext=(0.047, 0.0055),
     fontsize=7,
     color="#B03030",
-    ha="left",
+    ha="center",
+    va="bottom",
     arrowprops=dict(arrowstyle="->", color="#B03030",
                     lw=0.8, shrinkA=4, shrinkB=4),
     bbox=dict(boxstyle="round,pad=0.25", fc="white",
-              ec="#B03030", alpha=0.90, lw=0.7),
+              ec="#B03030", alpha=0.92, lw=0.7),
     zorder=9,
 )
 
